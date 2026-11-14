@@ -8,6 +8,7 @@ Rails apps need no configuration. Any other language or framework works with a s
 
 ```sh
 brew tap mbroadhead/treepot https://github.com/mbroadhead/treepot
+brew trust mbroadhead/treepot    # Homebrew asks you to trust third-party taps
 brew install treepot             # also installs Apple's container tool
 container system start           # once; offers to download a Linux kernel
 ```
