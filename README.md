@@ -146,19 +146,30 @@ Services keep running across `treepot up`; only the app VM is recreated. After c
 
 ## Stable names instead of IP addresses
 
-By default `treepot` shows IP addresses, and they change whenever a VM is recreated. Apple's `container` has local DNS built in; set it up once and every VM gets a stable name:
+By default `treepot` shows IP addresses, and they change whenever a VM is recreated. Run this once per Mac to get stable names:
 
 ```sh
-# 1. ~/.config/container/config.toml
-[dns]
-domain = "test"
+treepot dns
+```
 
-# 2. restart container, then register the domain with macOS (needs sudo)
+From then on `treepot up` and `treepot status` show names such as `myapp-feature-app.test` and `myapp-feature-postgres.test`, usable from your Mac's browser and database tools. The pattern is `<project>-<worktree>-<service>.<domain>`.
+
+What the command does:
+
+- **Sets the domain** in Apple `container`'s config (`~/.config/container/config.toml`) and restarts `container`. The restart stops every running VM, so it asks first.
+- **Registers the domain with macOS** using `sudo`, which asks for your password. After this, all `.test` lookups on your Mac go to `container`.
+
+`treepot dns status` shows what is set up. Use another domain with `treepot dns vm` if `.test` is taken by another tool. It is safe to re-run: it only does the steps still missing.
+
+If `config.toml` already exists, `treepot` won't edit it and prints the lines to add instead. The manual equivalent of the whole setup is:
+
+```sh
+printf '[dns]\ndomain = "test"\n' > ~/.config/container/config.toml
 container system stop && container system start
 sudo container system dns create test
 ```
 
-From then on `treepot up` and `treepot status` show names such as `myapp-feature-app.test` and `myapp-feature-postgres.test`, usable from your Mac's browser and database tools. The pattern is `<project>-<worktree>-<service>.<domain>`. Until both steps are done, `treepot` keeps showing IPs.
+To undo it: remove the `[dns]` lines, restart `container`, and run `sudo container system dns delete test`.
 
 ## CLI tools and libraries
 
@@ -180,7 +191,7 @@ treepot ./mytool --fail; echo $?         # so is the exit code
 
 - The worktree is mounted at its host path, so `git` works inside the VM, including in linked worktrees.
 - Everything `treepot` creates is labelled with the worktree's name, so `status`, `down` and `destroy` only ever touch that worktree's VMs and volumes.
-- Test the harness itself: `test/detect_test.sh`.
+- Test the harness itself: `test/detect_test.sh` and `test/dns_test.sh`. Neither starts a VM or changes the system.
 
 ## License
 

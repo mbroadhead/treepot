@@ -15,6 +15,15 @@ class Treepot < Formula
     bin.install_symlink libexec/"bin/treepot"
   end
 
+  def caveats
+    <<~EOS
+      Start Apple's container service once before first use:
+        container system start
+      For stable hostnames (<worktree>-app.test) instead of IP addresses, run once:
+        treepot dns
+    EOS
+  end
+
   test do
     assert_match "usage: treepot", shell_output("#{bin}/treepot --help")
   end

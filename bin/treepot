@@ -200,6 +200,7 @@ cmd_up() {
   else
     echo "next: treepot <command>   (a server must bind 0.0.0.0 to be reachable from the Mac)"
   fi
+  [[ $(addr "$SLUG-app") == *[a-z]* ]] || echo "tip: run 'treepot dns' once for stable names ($SLUG-app.test) instead of IPs"
 }
 
 cmd_exec() {
@@ -235,6 +236,46 @@ cmd_destroy() {
     container volume rm "$v" >/dev/null
   done
   echo "destroyed: $SLUG"
+}
+
+dns_configured() { # the domain container registers VMs under, or nothing
+  container system property list 2>/dev/null | awk '/^\[dns\]/{f=1; next} /^\[/{f=0} f && $1=="domain"{gsub(/"/, "", $3); print $3}'
+}
+
+cmd_dns() { # [status | <domain>]: one-time setup of Apple container's local DNS, for stable names instead of IPs
+  local want=${1:-} conf=$HOME/.config/container/config.toml cur reg a
+  cur=$(dns_configured); reg=$(container system dns list 2>/dev/null | awk 'NR>1{print $1}' | tr '\n' ' ')
+  if [[ $want == status ]]; then
+    echo "container's DNS domain:   ${cur:-not set}"
+    echo "resolvable from this Mac: ${reg:-none}"
+    if [[ -n $cur && " $reg " == *" $cur "* ]]; then
+      echo "ok: VMs are reachable as <project>-<worktree>-<service>.$cur"
+    else
+      echo "not set up: run 'treepot dns'"
+    fi
+    return
+  fi
+  : "${want:=${cur:-test}}"
+  [[ $want =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || die "bad domain '$want' (e.g. test, vm, dev.internal)"
+
+  if [[ $cur != "$want" ]]; then
+    [[ -z $cur ]] || die "container's DNS domain is already '$cur'; run 'treepot dns' to finish setting that one up, or change it in $conf yourself"
+    # Never edit a config we did not write.
+    [[ ! -e $conf ]] || die "$conf already exists. Add these two lines to it, run 'container system stop && container system start', then re-run 'treepot dns $want':
+[dns]
+domain = \"$want\""
+    echo "This sets container's DNS domain to '$want' and restarts Apple container."
+    echo "The restart stops ALL running VMs, in every worktree ($(container ls -q 2>/dev/null | wc -l | tr -d ' ') running now)."
+    read -r -p "Continue? [y/N] " a
+    [[ $a == y || $a == Y ]] || die "aborted"
+    mkdir -p "$(dirname "$conf")" && printf '[dns]\ndomain = "%s"\n' "$want" > "$conf"
+    container system stop >/dev/null && container system start >/dev/null
+  fi
+  if [[ " $reg " != *" $want "* ]]; then
+    echo "Registering .$want with macOS; sudo may ask for your password."
+    sudo container system dns create "$want"
+  fi
+  echo "done: after the next 'treepot up', VMs are reachable as <project>-<worktree>-<service>.$want"
 }
 
 cmd_init() { # [template] [--with a,b|none]: write a starter config for this project
@@ -275,6 +316,7 @@ usage: treepot <command>   (run inside any git worktree of your project)
   destroy [-f]  down + delete the data and dependency volumes
   init [template] [--with postgres,mysql,redis|none]
                 write a starter config; picks the template and services from the project if not given
+  dns [domain]  one-time setup of stable names (<worktree>-app.test) instead of IPs; 'dns status' to check
   build         (re)build the app image for this Ruby version (Ruby apps only)
 Rails apps need no config. Anything else, and any override: $TREEPOT_CONFIG/<project>.ini  (see README)
 EOF
@@ -283,6 +325,8 @@ EOF
 main() {
   [[ $# -gt 0 && $1 != -h && $1 != --help && $1 != help ]] || { usage; exit 0; }
   command -v container >/dev/null || die "Apple 'container' CLI not found (brew install container && container system start)"
+
+  if [[ $1 == dns ]]; then shift; cmd_dns "$@"; exit; fi
 
   TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
   COMMON=$(git rev-parse --path-format=absolute --git-common-dir)
