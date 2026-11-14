@@ -190,6 +190,7 @@ treepot ./mytool --fail; echo $?         # so is the exit code
 ## Notes
 
 - The worktree is mounted at its host path, so `git` works inside the VM, including in linked worktrees.
+- A project that isn't a git repository works too, as a single environment. Its root is the nearest parent directory you ran `treepot init` in, or else the nearest one containing a `Gemfile`, `go.mod`, `pyproject.toml`, `requirements.txt`, `cpanfile` or `package.json`.
 - Everything `treepot` creates is labelled with the worktree's name, so `status`, `down` and `destroy` only ever touch that worktree's VMs and volumes.
 - Test the harness itself: `test/detect_test.sh` and `test/dns_test.sh`. Neither starts a VM or changes the system.
 

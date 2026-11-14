@@ -64,6 +64,15 @@ eq "$(slug_for /src/Shop_Feature.X shop)" shop-shop-feature-x "linked worktree s
 
 eq "$(slug_for /src/shop-feature shop)" shop-feature "project-prefixed worktree dir is not doubled"
 
+mkdir -p "$t/proj/frontend/src" "$t/proj/t" "$t/cfgs" "$t/bare/sub"
+touch "$t/proj/cpanfile" "$t/proj/frontend/package.json"
+eq "$(find_root "$t/proj/t" "$t/cfgs")" "$t/proj" "root from a subdirectory via the manifest"
+eq "$(find_root "$t/proj/frontend/src" "$t/cfgs")" "$t/proj/frontend" "no config yet: nearest manifest wins"
+touch "$t/cfgs/proj.ini"
+eq "$(find_root "$t/proj/frontend/src" "$t/cfgs")" "$t/proj" "an initialised project beats a nested manifest"
+eq "$(find_root "$t/bare/sub" "$t/cfgs")" "$t/bare/sub" "no markers at all -> the directory itself"
+eq "$(HOME=$t/proj find_root "$t/proj/t" "$t/cfgs")" "$t/proj/t" "HOME is never a project root"
+
 vm() { printf '{"status":{"networks":[{"hostname":"%s","ipv4Address":"192.168.64.5/24"}]}}' "$1"; }
 ad() { vm "$1" | jq -r --argjson d "$2" "$JQ_ADDR addr"; }
 eq "$(ad shop-app.test. '["test"]')" shop-app.test "DNS name when its domain is resolvable from the Mac"

@@ -49,6 +49,24 @@ detect_template() {
   fi
 }
 
+# Project root for a directory outside git: the nearest ancestor that already has a treepot config,
+# else the nearest one with a dependency manifest, else the directory itself. $HOME and / are never roots.
+find_root() { # <start dir> <config dir>
+  local d pass
+  for pass in config manifest; do
+    d=$1
+    while [[ $d != / && $d != "$HOME" ]]; do
+      if [[ $pass == config ]]; then
+        [[ ! -f $2/$(basename "$d").ini ]] || { echo "$d"; return; }
+      else
+        [[ -z $(detect_template "$d") ]] || { echo "$d"; return; }
+      fi
+      d=$(dirname "$d")
+    done
+  done
+  echo "$1"
+}
+
 project_for() { # <git common dir>
   if [[ $(basename "$1") == .git ]]; then basename "$(dirname "$1")"; else basename "$1" .git; fi
 }
@@ -308,7 +326,7 @@ cmd_init() { # [template] [--with a,b|none]: write a starter config for this pro
 
 usage() {
   cat <<EOF
-usage: treepot <command>   (run inside any git worktree of your project)
+usage: treepot <command>   (run anywhere inside your project; each git worktree is its own environment)
   up            start this worktree's VMs (app + services) and install dependencies
   <anything>    run it in the app VM, e.g. treepot rails s, treepot bash, treepot uv run pytest
   status        this worktree's VMs, state and addresses
@@ -328,8 +346,12 @@ main() {
 
   if [[ $1 == dns ]]; then shift; cmd_dns "$@"; exit; fi
 
-  TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
-  COMMON=$(git rev-parse --path-format=absolute --git-common-dir)
+  # Without git there are no worktrees: the project is one directory, found by its config or manifest.
+  if TOP=$(git rev-parse --show-toplevel 2>/dev/null); then
+    COMMON=$(git rev-parse --path-format=absolute --git-common-dir)
+  else
+    TOP=$(find_root "$PWD" "$TREEPOT_CONFIG") COMMON=$TOP/.git
+  fi
   local project; project=$(project_for "$COMMON")
   SLUG=$(slug_for "$TOP" "$project")
   CFG=$TREEPOT_CONFIG/$project.ini
