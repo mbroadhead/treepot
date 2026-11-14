@@ -1,8 +1,8 @@
 # treepot
 
-Dev environments in Apple [`container`](https://github.com/apple/container) micro-VMs, one per git worktree. Each worktree gets its own app VM, database VM and volumes. Nothing is added to the app repo.
+Dev environments in Apple [`container`](https://github.com/apple/container) micro-VMs, one per git worktree. Each worktree gets its own app VM, service VMs (databases and anything else) and volumes. Nothing is added to the project's repo.
 
-Rails apps need no configuration. Any other language or framework works with a short config file (see [Other frameworks](#other-frameworks)), and the project doesn't have to be a web app (see [CLI tools and libraries](#cli-tools-and-libraries)).
+Rails apps need no configuration. Any other language or framework needs one short config file, which `treepot init` writes for you. The project doesn't have to be a web app.
 
 ## Setup
 
@@ -17,88 +17,155 @@ Or from a clone, with no Homebrew: `ln -s "$PWD/bin/treepot" ~/.local/bin/treepo
 
 ## Use
 
-From any worktree of your app:
+From any worktree of your project:
 
 ```sh
-treepot up                 # build image, start db (+ redis), start app VM, bundle install
-treepot rails db:prepare
-treepot rails s            # open the URL that `treepot up` printed; every worktree has its own IP on port 3000
-treepot bash               # anything that isn't an treepot command runs in the app VM
+treepot init              # not needed for Rails; writes ~/.config/treepot/<project>.ini
+treepot up                # start services and the app VM, install dependencies
+treepot rails s           # anything that isn't a treepot command runs in the app VM
+treepot bash
 treepot status
-treepot down               # remove the VMs, keep the database and gems
-treepot destroy            # also delete the volumes; run before `git worktree remove`
+treepot down              # remove the VMs, keep data and installed dependencies
+treepot destroy           # also delete the volumes; run before `git worktree remove`
 ```
 
-## What it detects (Ruby apps)
+`treepot up` prints each VM's address. A server must listen on `0.0.0.0`, not `localhost`, to be reachable from your Mac.
 
-| Setting | Source | Override |
-|---|---|---|
-| Ruby | `.ruby-version`, `.tool-versions`, then `Gemfile.lock` | `RUBY_VERSION` |
-| Database | `pg` / `mysql2` / `trilogy` in `Gemfile.lock`, else sqlite (no DB VM) | `DB`, `DB_IMAGE` |
-| Redis | `redis` gem in `Gemfile.lock` | `REDIS=0\|1`, `REDIS_IMAGE` |
+## Rails
 
-Overrides go in `~/.config/treepot/<project>.env`, where `<project>` is the main repo's directory name:
+With a `Gemfile` and no config file, everything is detected:
 
-```sh
-# ~/.config/treepot/shop.env
-DB_IMAGE=mariadb:11          # default: postgres:17 or mysql:8.4
-APT_PACKAGES="libvips-dev"   # extra packages for the app image; run `treepot build` after changing
-IMAGE=my/custom:image        # skip the built image entirely (use for Rubies too old for the Dockerfile)
-CPUS=8 MEMORY=8G             # default: 4 / 4G
-```
+| Setting | Source |
+|---|---|
+| Ruby version | `.ruby-version`, `.tool-versions`, then `Gemfile.lock` |
+| Services | `pg` → postgres, `mysql2`/`trilogy` → mysql, `redis` → redis (all that are present) |
 
-## Other frameworks
+The app image is built once per Ruby version and includes Node, yarn and the database clients. To change something, add a config file with just the keys you need (see [Config reference](#config-reference)). Any `[service]` section in it replaces the detected services.
 
-Anything without a `Gemfile` needs a config file at `~/.config/treepot/<project>.env`, where `<project>` is the main repo's directory name. Start from a template:
+## Other languages
 
 ```sh
 cd ~/src/myapi
-treepot init fastapi-uv    # writes ~/.config/treepot/myapi.env
-treepot up
+treepot init
+# template: python-uv
+# services: postgres (detected; ...)
+# wrote ~/.config/treepot/myapi.ini; review it, then run 'treepot up'
 ```
 
-`treepot init` with no argument lists the templates. Each one is a short commented file in [`examples/`](examples) that also shows the command to start the server.
+`treepot init` picks a template from the files in the worktree and adds a service for each database driver it finds in your dependencies. Name a template or pass `--with` to override either choice:
 
-| Template | For | Dependencies from | Run with |
+```sh
+treepot init python-pip --with postgres,redis
+treepot init --with none
+```
+
+| Template | Chosen when it finds | Use for | Typical command |
 |---|---|---|---|
-| `fastapi-uv` | FastAPI, or any uv project | `pyproject.toml` | `treepot uv run fastapi dev --host 0.0.0.0` |
-| `python-pip` | Django, Flask | `requirements.txt` | `treepot python manage.py runserver 0.0.0.0:8000` |
-| `node` | Express, Next.js | `package.json` | `treepot npm run dev` |
-| `mojolicious` | Mojolicious, Dancer | `cpanfile` | `treepot perl app.pl daemon -l http://0.0.0.0:3000` |
-| `go` | Go CLI tools, libraries, servers | `go.mod` | `treepot go run .` |
+| `ruby-bundler` | `Gemfile` | Non-Rails Ruby: CLI tools, gems, Sinatra | `treepot ruby bin/mytool` |
+| `go` | `go.mod` | Go CLI tools, libraries, servers | `treepot go run .` |
+| `python-uv` | `uv.lock`, `pyproject.toml` | FastAPI, CLI tools, libraries | `treepot uv run pytest` |
+| `python-pip` | `requirements.txt` | Django, Flask | `treepot python manage.py runserver 0.0.0.0:8000` |
+| `perl-cpanm` | `cpanfile`, `Makefile.PL`, `Build.PL` | Mojolicious, Dancer, CLI tools, modules | `treepot prove -lr t` |
+| `node-npm` | `package.json` | Express, Next.js, CLI tools | `treepot npm run dev` |
 
-A server must listen on `0.0.0.0`, not `localhost`, to be reachable from your Mac. Open `http://<ip>:<port>` using the IP that `treepot up` prints.
+The templates are the commented files in [`examples/`](examples). Service detection is a text search for well-known driver names (`psycopg`, `pg`, `DBD::Pg`, `mysqlclient`, `ioredis` and so on); if it misses yours, use `--with` or edit the file.
 
-### Config keys
+## Config reference
 
-The config file is a bash file that `treepot` sources, so quoting follows shell rules. `$TOP` holds the worktree's path.
+`~/.config/treepot/<project>.ini`, where `<project>` is the main repo's directory name. All worktrees of a project share it. The format is the same as a git config file: values containing `;` or `#` need double quotes, and a key may be repeated.
+
+```ini
+[app]
+    image = ghcr.io/astral-sh/uv:python3.13-bookworm
+    setup = uv sync
+    cache = /cache
+    env = UV_PROJECT_ENVIRONMENT=/cache/venv
+    env = UV_LINK_MODE=copy
+
+[service "postgres"]
+    image = postgres:17
+
+[service "mysql"]
+    image = mariadb:11
+
+[service "mail"]
+    image = axllent/mailpit:latest
+    env = MP_DATABASE=/data/mailpit.db
+    volume = /data
+    port = 8025
+```
+
+### `[app]`
 
 | Key | Meaning | Default |
 |---|---|---|
-| `IMAGE` | Image for the app VM | required |
-| `SETUP` | Shell command run in the worktree on every `treepot up`; make it cheap to re-run | none |
-| `CACHE` | Path in the VM kept in a per-worktree volume, for installed dependencies | none |
-| `APP_ENV` | Bash array of extra `KEY=value` variables for the app VM | none |
-| `DB` | `postgres`, `mysql` or `none` | `none` |
-| `DB_IMAGE` | Database image | `postgres:17` or `mysql:8.4` |
-| `REDIS` | `1` to start a Redis VM | `0` |
-| `CPUS`, `MEMORY` | App VM size | `4`, `4G` |
+| `image` | Image for the app VM | required, except for Ruby projects |
+| `setup` | Shell command run in the worktree on every `treepot up`; make it cheap to re-run | none (Ruby: `bundle install` if needed) |
+| `cache` | Path kept in a per-worktree volume, for installed dependencies. A relative path is inside the worktree. | none (Ruby: `/usr/local/bundle`) |
+| `env` | `KEY=value` for the app VM; repeatable | none |
+| `cpus`, `memory` | App VM size | `4`, `4G` |
+| `ruby` | Ruby version, when it can't be detected | detected |
+| `apt` | Extra apt packages for the built Ruby image; run `treepot build` after changing | none |
 
-### Writing a config for another framework
+If a tool insists on an empty directory, point it at a subdirectory of `cache`: a fresh volume contains `lost+found`.
 
-1. **`IMAGE`:** pick the official language image (`elixir:1.18`, `php:8.4`, `rust:1`).
-2. **`CACHE` and `SETUP`:** find where the package manager installs dependencies and point `CACHE` there, then set `SETUP` to the install command. If the tool demands an empty directory, use a subdirectory of `CACHE`, because a fresh volume contains `lost+found`.
-3. **`APP_ENV`:** add whatever tells the language to look in that location (`PERL5LIB`, `VIRTUAL_ENV`, `GOMODCACHE`).
-4. **`DB`:** set it if the app needs a database, then read `DATABASE_URL` in the app.
+### `[service "<name>"]`
 
-The same keys work for Ruby apps, where they override the detected defaults.
+Each section is one VM per worktree. A service can be any Docker (OCI) image with a Linux arm64 build.
+
+| Key | Meaning |
+|---|---|
+| `image` | Image to run. Required, except for the built-ins below. |
+| `env` | `KEY=value` for the service; repeatable |
+| `volume` | Path inside the service to keep in a per-worktree volume, so data survives `down` |
+| `port` | `treepot up` waits until this port accepts connections before starting the app |
+
+Three names are built in. `treepot` gives them a password, a data volume and a readiness check, so `image` is all you might set:
+
+| Name | Default image | Login | The app VM also gets |
+|---|---|---|---|
+| `postgres` | `postgres:17` | `postgres` / `postgres` | `POSTGRES_URL`, `PGHOST`, `PGUSER`, `PGPASSWORD` |
+| `mysql` | `mysql:8.4` (MariaDB images work) | `root` / `root` | `MYSQL_URL` |
+| `redis` | `redis:7` | none | `REDIS_URL` |
+
+Any other name is a generic service: `treepot` runs the image with its default command and the settings you give it. What the image needs is documented on its registry page.
+
+## How the app finds its services
+
+For every service, the app VM gets:
+
+- **A hostname:** the service's name. `postgres`, `mysql` or `mail` resolve from inside the app VM.
+- **`<NAME>_HOST`:** its address, for example `MAIL_HOST`.
+
+`DATABASE_URL` and `DB_HOST` point at the first database in the file.
+
+- **Rails** (a `config/database.yml` exists): the URLs carry host and credentials only, so `database.yml` still names separate development and test databases. For a second database, point its `database.yml` entry at `ENV["MYSQL_URL"]` or `ENV["POSTGRES_URL"]`.
+- **Everything else:** the URLs point at a ready-made database called `app`.
+
+Services keep running across `treepot up`; only the app VM is recreated. After changing a service's settings, run `treepot down` then `treepot up`.
+
+## Stable names instead of IP addresses
+
+By default `treepot` shows IP addresses, and they change whenever a VM is recreated. Apple's `container` has local DNS built in; set it up once and every VM gets a stable name:
+
+```sh
+# 1. ~/.config/container/config.toml
+[dns]
+domain = "test"
+
+# 2. restart container, then register the domain with macOS (needs sudo)
+container system stop && container system start
+sudo container system dns create test
+```
+
+From then on `treepot up` and `treepot status` show names such as `myapp-feature-app.test` and `myapp-feature-postgres.test`, usable from your Mac's browser and database tools. The pattern is `<project>-<worktree>-<service>.<domain>`. Until both steps are done, `treepot` keeps showing IPs.
 
 ## CLI tools and libraries
 
-Nothing requires a server or a database. With `DB` unset, `treepot up` starts only the app VM, and `treepot <command>` behaves like running the command locally:
+Nothing requires a server or a database. With no `[service]` sections, `treepot up` starts only the app VM, and `treepot <command>` behaves like running the command locally:
 
 ```sh
-treepot init go && treepot up
+treepot init && treepot up
 treepot go test ./...
 echo input | treepot go run . --stdin    # stdin is passed through
 treepot ./mytool --fail; echo $?         # so is the exit code
@@ -109,19 +176,10 @@ treepot ./mytool --fail; echo $?         # so is the exit code
 - **Each worktree has its own dependency and build cache**, so a second worktree pays the first-build cost again.
 - **macOS-specific behaviour can't be tested**: the VM is Linux.
 
-## How the app finds its services
-
-The app VM gets `DATABASE_URL`, `PGHOST`/`PGUSER`/`PGPASSWORD`, `MYSQL_HOST`, `DB_HOST`, `REDIS_URL` and `BINDING=0.0.0.0`. Credentials are `postgres`/`postgres` or `root`/`root`.
-
-- **Rails** (a `config/database.yml` exists): `DATABASE_URL` has host and credentials only, so `database.yml` still names separate dev and test databases.
-- **Everything else:** `DATABASE_URL` points at a ready-made database called `app`.
-
-Multi-database Rails apps: `DATABASE_URL` only covers the primary, so point the other entries in `database.yml` at `ENV["DB_HOST"]`.
-
 ## Notes
 
-- IPs can change after `treepot down`/`treepot up` or a reboot; `treepot up` rewires the app VM each time. For stable `<name>.test` hostnames see the [container networking docs](https://github.com/apple/container/blob/main/docs/networking.md) (needs sudo).
 - The worktree is mounted at its host path, so `git` works inside the VM, including in linked worktrees.
+- Everything `treepot` creates is labelled with the worktree's name, so `status`, `down` and `destroy` only ever touch that worktree's VMs and volumes.
 - Test the harness itself: `test/detect_test.sh`.
 
 ## License

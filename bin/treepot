@@ -4,10 +4,11 @@ set -euo pipefail
 
 TREEPOT_HOME="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.." && pwd)"
 TREEPOT_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/treepot"
+PRESETS="postgres mysql redis"
 
 die() { echo "treepot: $*" >&2; exit 1; }
 
-# ---- detection (pure functions of an app dir; covered by test/detect_test.sh) ----
+# ---- detection (pure functions of a project dir; covered by test/detect_test.sh) ----
 
 detect_ruby() {
   local d=$1 v=""
@@ -23,12 +24,29 @@ detect_ruby() {
 
 has_gem() { [[ -f $1/Gemfile.lock ]] && grep -Eq "^    $2 \(" "$1/Gemfile.lock"; }
 
-# Prints the DATABASE_URL scheme: postgres | mysql2 | trilogy | sqlite
-detect_db() {
-  if has_gem "$1" pg; then echo postgres
-  elif has_gem "$1" mysql2; then echo mysql2
-  elif has_gem "$1" trilogy; then echo trilogy
-  else echo sqlite; fi
+# Prints the preset services a project's dependency files mention, one per line.
+# shortcut: a text search for known driver names, not a dependency resolver; unknown drivers need a [service] section by hand.
+detect_services() {
+  local d=$1 f files=()
+  for f in Gemfile.lock pyproject.toml requirements.txt package.json cpanfile go.mod; do
+    [[ ! -f $d/$f ]] || files+=("$d/$f")
+  done
+  [[ ${#files[@]} -gt 0 ]] || return 0
+  ! grep -Eqs '^    pg \(|psycopg|asyncpg|"pg"|"postgres"|DBD::Pg|Mojo::Pg|jackc/pgx|lib/pq' "${files[@]}" || echo postgres
+  ! grep -Eqs '^    (mysql2|trilogy) \(|mysqlclient|[Pp]y[Mm]y[Ss][Qq][Ll]|aiomysql|"mysql2?"|DBD::(mysql|MariaDB)|Mojo::mysql|go-sql-driver/mysql' "${files[@]}" || echo mysql
+  ! grep -Eqs "^    redis \(|^redis([^a-z-]|$)|\"redis[\">=<~[]|\"ioredis\"|'(Mojo::)?Redis'|go-redis|gomodule/redigo" "${files[@]}" || echo redis
+}
+
+# Prints the starter template that fits a project dir, or nothing.
+detect_template() {
+  local d=$1
+  if [[ -f $d/Gemfile ]]; then echo ruby-bundler
+  elif [[ -f $d/go.mod ]]; then echo go
+  elif [[ -f $d/uv.lock || -f $d/pyproject.toml ]]; then echo python-uv
+  elif [[ -f $d/requirements.txt ]]; then echo python-pip
+  elif [[ -f $d/cpanfile || -f $d/Makefile.PL || -f $d/Build.PL ]]; then echo perl-cpanm
+  elif [[ -f $d/package.json ]]; then echo node-npm
+  fi
 }
 
 project_for() { # <git common dir>
@@ -43,19 +61,44 @@ slug_for() { # <worktree top> <project>
   printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-'
 }
 
+# ---- config: an INI file read with git's own parser ($CFG may not exist) ----
+
+cfg() { [[ ! -f $CFG ]] || git config -f "$CFG" --get "$1" || true; }
+cfg_all() { [[ ! -f $CFG ]] || git config -f "$CFG" --get-all "$1" || true; }
+cfg_has() { [[ -f $CFG ]] && git config -f "$CFG" --get "$1" >/dev/null; }
+# Names of the [service "<name>"] sections, in file order.
+cfg_services() {
+  [[ ! -f $CFG ]] || git config -f "$CFG" --name-only --list | sed -nE 's/^service\.(.*)\.[^.]+$/\1/p' | awk '!seen[$0]++'
+}
+
+preset_image() {
+  case $1 in postgres) echo postgres:17 ;; mysql) echo mysql:8.4 ;; redis) echo redis:7 ;; esac
+}
+
 # ---- container helpers ----
 
 state() { container inspect "$1" 2>/dev/null | jq -r '.[0].status.state // empty' 2>/dev/null || true; }
 ip() { container inspect "$1" | jq -r '.[0].status.networks[0].ipv4Address' | cut -d/ -f1; }
 
+# jq: the address to show for a VM. Its DNS name when Apple container's local DNS covers it
+# ($d = domains the Mac can resolve, from `container system dns list`), otherwise its IP.
+JQ_ADDR='def addr: (.status.networks[0] // {}) as $n | (($n.hostname // "") | rtrimstr(".")) as $h
+  | ($h | split(".")[1:] | join(".")) as $dom
+  | if $dom != "" and ($d | any(. == $dom)) then $h else (($n.ipv4Address // "-") | split("/")[0]) end;'
+dns_domains() { container system dns list 2>/dev/null | awk 'NR>1{print $1}' | jq -Rsc 'split("\n") | map(select(. != ""))'; }
+addr() { container inspect "$1" | jq -r --argjson d "$(dns_domains)" "$JQ_ADDR .[0] | addr"; }
+
+# Everything treepot creates is labelled with the worktree's slug, so status/down/destroy never depend on the current config.
 ensure_running() { # <name> <container run args...>
   local name=$1; shift
   case "$(state "$name")" in
     running) ;;
-    "") container run -d --name "$name" "$@" >/dev/null ;;
+    "") container run -d --name "$name" -l "treepot=$SLUG" "$@" >/dev/null ;;
     *) container start "$name" >/dev/null ;;
   esac
 }
+
+volume() { container volume create --label "treepot=$SLUG" "$1" >/dev/null 2>&1 || true; }  # fails harmlessly if it exists
 
 wait_port() { # <ip> <port>; DB images only open TCP once init has finished
   local i
@@ -68,61 +111,94 @@ wait_port() { # <ip> <port>; DB images only open TCP once init has finished
 
 build_image() {
   container build -t "$IMAGE" --build-arg "RUBY_VERSION=$RUBY_VERSION" \
-    --build-arg "APT_PACKAGES=${APT_PACKAGES:-}" "$TREEPOT_HOME"
+    --build-arg "APT_PACKAGES=$(cfg app.apt)" "$TREEPOT_HOME"
+}
+
+# Starts one service VM and records how the app reaches it in APP_ARGS (env) and HOSTS (name resolution).
+start_service() { # <name>
+  local name=$1 c="$SLUG-$1" image port="" kv path sip scheme
+  local run=()  # everything after the container name for `container run`
+  [[ $name =~ ^[a-z][a-z0-9-]*$ && $name != app ]] || die "bad service name '$name' in $CFG (lowercase letters, digits, dashes; not 'app')"
+  image=$(cfg "service.$name.image"); [[ -n $image ]] || image=$(preset_image "$name")
+  [[ -n $image ]] || die "service '$name' needs 'image = ...' in $CFG"
+  while IFS= read -r kv; do [[ -z $kv ]] || run+=(-e "$kv"); done < <(cfg_all "service.$name.env")
+
+  case $name in
+    postgres)
+      port=5432; volume "$c-data"
+      # PGDATA in a subdir: a fresh volume's lost+found makes initdb refuse the mount root.
+      run+=(-e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=app -e PGDATA=/var/lib/postgresql/data/pgdata
+        -v "$c-data:/var/lib/postgresql/data" "$image") ;;
+    mysql)
+      port=3306; volume "$c-data"
+      # --datadir in a subdir for the same lost+found reason.
+      run+=(-e MYSQL_ROOT_PASSWORD=root -e MARIADB_ROOT_PASSWORD=root -e MYSQL_DATABASE=app
+        -v "$c-data:/var/lib/treepot" "$image" --datadir=/var/lib/treepot/data) ;;
+    redis)
+      port=6379; run+=("$image") ;;
+    *)
+      port=$(cfg "service.$name.port"); path=$(cfg "service.$name.volume")
+      if [[ -n $path ]]; then volume "$c-data"; run+=(-v "$c-data:$path"); fi
+      run+=("$image") ;;
+  esac
+
+  ensure_running "$c" "${run[@]}"
+  sip=$(ip "$c")
+  [[ -z $port ]] || wait_port "$sip" "$port"
+  HOSTS+="$sip $name"$'\n'
+  APP_ARGS+=(-e "$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')_HOST=$sip")
+
+  case $name in
+    postgres)
+      APP_ARGS+=(-e "POSTGRES_URL=postgresql://postgres:postgres@$sip$DBNAME"
+        -e "PGHOST=$sip" -e PGUSER=postgres -e PGPASSWORD=postgres)
+      [[ -n $HAVE_DB ]] || APP_ARGS+=(-e "DATABASE_URL=postgresql://postgres:postgres@$sip$DBNAME" -e "DB_HOST=$sip")
+      HAVE_DB=1 ;;
+    mysql)
+      scheme=mysql  # Rails wants its adapter name as the scheme
+      if has_gem "$TOP" mysql2; then scheme=mysql2; elif has_gem "$TOP" trilogy; then scheme=trilogy; fi
+      APP_ARGS+=(-e "MYSQL_URL=$scheme://root:root@$sip$DBNAME")
+      [[ -n $HAVE_DB ]] || APP_ARGS+=(-e "DATABASE_URL=$scheme://root:root@$sip$DBNAME" -e "DB_HOST=$sip")
+      HAVE_DB=1 ;;
+    redis)
+      APP_ARGS+=(-e "REDIS_URL=redis://$sip:6379/0") ;;
+  esac
 }
 
 # ---- commands ----
 
 cmd_up() {
-  local env=(-e BINDING=0.0.0.0
+  local s kv cpus mem
+  APP_ARGS=(-e BINDING=0.0.0.0
     -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e "GIT_CONFIG_VALUE_0=*")
-  local db_ip kv
+  HOSTS="" HAVE_DB=""
   # Rails names its databases in database.yml; everything else gets a ready-made "app" database in the URL.
-  local dbname=/app; [[ ! -f $TOP/config/database.yml ]] || dbname=""
-  for kv in ${APP_ENV[@]+"${APP_ENV[@]}"}; do env+=(-e "$kv"); done
+  DBNAME=/app; [[ ! -f $TOP/config/database.yml ]] || DBNAME=""
 
-  if [[ -z ${IMAGE_SET:-} ]] && ! container image inspect "$IMAGE" >/dev/null 2>&1; then build_image; fi
+  if [[ -n $BUILD ]] && ! container image inspect "$IMAGE" >/dev/null 2>&1; then build_image; fi
 
-  case $DB in
-    postgres)
-      # PGDATA in a subdir: a fresh volume's lost+found makes initdb refuse the mount root.
-      ensure_running "$SLUG-db" -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=app -e PGDATA=/var/lib/postgresql/data/pgdata \
-        -v "$SLUG-dbdata:/var/lib/postgresql/data" "${DB_IMAGE:-postgres:17}"
-      db_ip=$(ip "$SLUG-db"); wait_port "$db_ip" 5432
-      env+=(-e "DATABASE_URL=postgresql://postgres:postgres@$db_ip$dbname" -e "DB_HOST=$db_ip"
-        -e "PGHOST=$db_ip" -e PGUSER=postgres -e PGPASSWORD=postgres) ;;
-    mysql|mysql2|trilogy)
-      # --datadir in a subdir for the same lost+found reason.
-      ensure_running "$SLUG-db" -e MYSQL_ROOT_PASSWORD=root -e MARIADB_ROOT_PASSWORD=root -e MYSQL_DATABASE=app \
-        -v "$SLUG-dbdata:/var/lib/treepot" "${DB_IMAGE:-mysql:8.4}" --datadir=/var/lib/treepot/data
-      db_ip=$(ip "$SLUG-db"); wait_port "$db_ip" 3306
-      env+=(-e "DATABASE_URL=$DB://root:root@$db_ip$dbname" -e "DB_HOST=$db_ip" -e "MYSQL_HOST=$db_ip") ;;
-    sqlite|none) ;;
-    *) die "unknown DB '$DB' (postgres, mysql, mysql2, trilogy, none)" ;;
-  esac
-
-  if [[ $REDIS == 1 ]]; then
-    ensure_running "$SLUG-redis" "${REDIS_IMAGE:-redis:7}"
-    env+=(-e "REDIS_URL=redis://$(ip "$SLUG-redis"):6379/0")
-  fi
+  for s in $SERVICES; do start_service "$s"; done
+  while IFS= read -r kv; do [[ -z $kv ]] || APP_ARGS+=(-e "$kv"); done < <(cfg_all app.env)
 
   # Same absolute paths as the host: a linked worktree's .git file points at the main repo by absolute path.
-  local mounts=(-v "$TOP:$TOP")
-  [[ $COMMON == "$TOP"/* ]] || mounts+=(-v "$COMMON:$COMMON")
-  [[ -z $CACHE ]] || mounts+=(-v "$SLUG-cache:$CACHE")
+  APP_ARGS+=(-v "$TOP:$TOP")
+  [[ $COMMON == "$TOP"/* ]] || APP_ARGS+=(-v "$COMMON:$COMMON")
+  if [[ -n $CACHE ]]; then volume "$SLUG-app-cache"; APP_ARGS+=(-v "$SLUG-app-cache:$CACHE"); fi
 
-  # Recreated every time so the DB/redis IPs baked into its env are never stale.
+  # Recreated every time so the service addresses baked into its env and /etc/hosts are never stale.
   container rm -f "$SLUG-app" >/dev/null 2>&1 || true
-  container run -d --name "$SLUG-app" -c "${CPUS:-4}" -m "${MEMORY:-4G}" \
-    "${mounts[@]}" -w "$TOP" "${env[@]}" \
-    "$IMAGE" sleep infinity >/dev/null
+  cpus=$(cfg app.cpus); mem=$(cfg app.memory)
+  ensure_running "$SLUG-app" -c "${cpus:-4}" -m "${mem:-4G}" -w "$TOP" "${APP_ARGS[@]}" "$IMAGE" sleep infinity
+  [[ -z $HOSTS ]] || printf '%s' "$HOSTS" | container exec -i "$SLUG-app" sh -c 'cat >> /etc/hosts' \
+    || echo "treepot: couldn't write service names to /etc/hosts; use the *_HOST variables" >&2
 
   [[ -z $SETUP ]] || container exec -w "$TOP" "$SLUG-app" sh -c "$SETUP"
-  echo "up: $SLUG (image $IMAGE, db $DB)"
-  if [[ -f $TOP/Gemfile ]]; then
-    echo "  treepot rails db:prepare && treepot rails s   ->   http://$(ip "$SLUG-app"):3000"
+  echo "up: $SLUG"
+  cmd_status | sed 's/^/  /'
+  if [[ -f $TOP/bin/rails ]]; then
+    echo "next: treepot rails db:prepare && treepot rails s   ->   http://$(addr "$SLUG-app"):3000"
   else
-    echo "  run commands with 'treepot <command>'; a server bound to 0.0.0.0 is reachable at $(ip "$SLUG-app")"
+    echo "next: treepot <command>   (a server must bind 0.0.0.0 to be reachable from the Mac)"
   fi
 }
 
@@ -134,49 +210,73 @@ cmd_exec() {
 }
 
 cmd_status() {
-  container ls -a --format json | jq -r --arg s "$SLUG" '
-    .[] | select(.configuration.id == ($s+"-app") or .configuration.id == ($s+"-db") or .configuration.id == ($s+"-redis"))
-    | [.configuration.id, .status.state, (.status.networks[0].ipv4Address // "-" | split("/")[0])] | @tsv'
+  container ls -a --format json | jq -r --arg s "$SLUG" --argjson d "$(dns_domains)" "$JQ_ADDR"'
+    .[] | select(.configuration.labels.treepot == $s)
+    | [(.configuration.id | ltrimstr($s + "-")), .status.state, addr] | @tsv' \
+    | sort | awk -F'\t' '{printf "%-12s %-8s %s\n", $1, $2, $3}'
 }
 
 cmd_down() {
   local c
-  for c in app db redis; do
-    [[ -z $(state "$SLUG-$c") ]] || container rm -f "$SLUG-$c" >/dev/null
+  for c in $(container ls -a --format json | jq -r --arg s "$SLUG" '.[] | select(.configuration.labels.treepot == $s) | .configuration.id'); do
+    container rm -f "$c" >/dev/null
   done
   echo "down: $SLUG (volumes kept)"
 }
 
 cmd_destroy() {
+  local v
   if [[ ${1:-} != -f ]]; then
-    read -r -p "Delete $SLUG's VMs AND its database + dependency volumes? [y/N] " a
+    read -r -p "Delete $SLUG's VMs AND its data + dependency volumes? [y/N] " a
     [[ $a == y || $a == Y ]] || die "aborted"
   fi
   cmd_down
-  local v
-  for v in cache dbdata bundle; do container volume rm "$SLUG-$v" >/dev/null 2>&1 || true; done  # bundle: pre-generic-mode name
+  for v in $(container volume ls --format json | jq -r --arg s "$SLUG" '.[] | select(.configuration.labels.treepot == $s) | .id'); do
+    container volume rm "$v" >/dev/null
+  done
   echo "destroyed: $SLUG"
 }
 
-cmd_init() { # <template>: copy a starter config for this project
-  local ex=$TREEPOT_HOME/examples
-  [[ -n ${1:-} && -f $ex/$1.env ]] || die "usage: treepot init <template>; templates: $(cd "$ex" && ls ./*.env | sed 's|^\./||; s|\.env$||' | tr '\n' ' ')"
+cmd_init() { # [template] [--with a,b|none]: write a starter config for this project
+  local ex=$TREEPOT_HOME/examples t="" with="" picked=detected s list
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --with) [[ $# -ge 2 ]] || die "--with needs a value, e.g. --with postgres,redis"; with=$2; picked=chosen; shift 2 ;;
+      *) t=$1; shift ;;
+    esac
+  done
+  list=$(cd "$ex" && ls ./*.ini | sed 's|^\./||; s|\.ini$||' | tr '\n' ' ')
+  [[ -n $t ]] || t=$(detect_template "$TOP")
+  [[ -n $t ]] || die "can't tell what kind of project this is; run 'treepot init <template>' with one of: $list"
+  [[ -f $ex/$t.ini ]] || die "no template '$t'; templates: $list"
   [[ ! -e $CFG ]] || die "$CFG already exists"
-  mkdir -p "$TREEPOT_CONFIG" && cp "$ex/$1.env" "$CFG"
+
+  if [[ $picked == chosen ]]; then with=$(printf '%s' "$with" | tr ',' ' '); else with=$(detect_services "$TOP" | tr '\n' ' '); fi
+  with=$(echo $with)  # normalise whitespace
+  [[ $with != none ]] || with=""
+  for s in $with; do
+    [[ " $PRESETS " == *" $s "* ]] || die "'$s' is not a built-in service ($PRESETS); add a [service \"$s\"] section to the config by hand"
+  done
+
+  mkdir -p "$TREEPOT_CONFIG" && cp "$ex/$t.ini" "$CFG"
+  for s in $with; do printf '\n[service "%s"]\n    image = %s\n' "$s" "$(preset_image "$s")" >> "$CFG"; done
+  echo "template: $t"
+  echo "services: ${with:-none} ($picked; change with --with postgres,mysql,redis or by editing the file)"
   echo "wrote $CFG; review it, then run 'treepot up'"
 }
 
 usage() {
   cat <<EOF
-usage: treepot <command>   (run inside any git worktree of your app)
-  up            start this worktree's VMs (app + db [+ redis]) and install dependencies
+usage: treepot <command>   (run inside any git worktree of your project)
+  up            start this worktree's VMs (app + services) and install dependencies
   <anything>    run it in the app VM, e.g. treepot rails s, treepot bash, treepot uv run pytest
-  status        this worktree's VMs, state and IPs
+  status        this worktree's VMs, state and addresses
   down          remove the VMs, keep volumes
-  destroy [-f]  down + delete the database and dependency volumes
-  init <name>   write a starter config for a non-Ruby app (run 'treepot init' to list templates)
+  destroy [-f]  down + delete the data and dependency volumes
+  init [template] [--with postgres,mysql,redis|none]
+                write a starter config; picks the template and services from the project if not given
   build         (re)build the app image for this Ruby version (Ruby apps only)
-Ruby/Rails apps are auto-detected. Anything else, and any override: $TREEPOT_CONFIG/<project>.env  (see README)
+Rails apps need no config. Anything else, and any override: $TREEPOT_CONFIG/<project>.ini  (see README)
 EOF
 }
 
@@ -188,32 +288,33 @@ main() {
   COMMON=$(git rev-parse --path-format=absolute --git-common-dir)
   local project; project=$(project_for "$COMMON")
   SLUG=$(slug_for "$TOP" "$project")
+  CFG=$TREEPOT_CONFIG/$project.ini
 
-  # shellcheck disable=SC1090  # the config may use $TOP
-  CFG=$TREEPOT_CONFIG/$project.env
-  if [[ $1 == init ]]; then cmd_init "${2:-}"; exit; fi
-  [[ ! -f $CFG ]] || source "$CFG"
-  IMAGE_SET=${IMAGE:-}
+  if [[ $1 == init ]]; then shift; cmd_init "$@"; exit; fi
+  [[ ! -f $CFG ]] || git config -f "$CFG" --list >/dev/null || die "can't parse $CFG"
+  [[ -f $CFG || ! -f ${CFG%.ini}.env ]] || die "${CFG%.ini}.env is the old config format; delete it and run 'treepot init'"
+
+  IMAGE=$(cfg app.image) SETUP=$(cfg app.setup) CACHE=$(cfg app.cache) SERVICES=$(cfg_services) BUILD=""
   if [[ -f $TOP/Gemfile ]]; then
-    : "${RUBY_VERSION:=$(detect_ruby "$TOP")}"
-    : "${DB:=$(detect_db "$TOP")}"
-    [[ $DB != mysql ]] || DB=mysql2  # the URL scheme Rails expects
-    if [[ -z ${REDIS:-} ]]; then REDIS=0; ! has_gem "$TOP" redis || REDIS=1; fi
-    [[ -n $IMAGE_SET || -n $RUBY_VERSION ]] || die "can't detect the Ruby version; set RUBY_VERSION in $CFG"
-    : "${IMAGE:=treepot-ruby:$RUBY_VERSION}"
-    : "${SETUP=bundle check >/dev/null 2>&1 || bundle install}"
-    : "${CACHE=/usr/local/bundle}"
+    RUBY_VERSION=$(cfg app.ruby); [[ -n $RUBY_VERSION ]] || RUBY_VERSION=$(detect_ruby "$TOP")
+    if [[ -z $IMAGE ]]; then
+      [[ -n $RUBY_VERSION ]] || die "can't detect the Ruby version; set 'ruby = x.y.z' under [app] in $CFG"
+      IMAGE=treepot-ruby:$RUBY_VERSION BUILD=1
+    fi
+    cfg_has app.setup || SETUP='bundle check >/dev/null 2>&1 || bundle install'
+    cfg_has app.cache || CACHE=/usr/local/bundle
+    [[ -n $SERVICES ]] || SERVICES=$(detect_services "$TOP")
   else
-    [[ -n $IMAGE_SET ]] || die "no Gemfile in $TOP, so nothing to auto-detect; for a non-Ruby app run 'treepot init <template>' (run 'treepot init' to list them) or write $CFG by hand"
-    : "${DB:=none}" "${REDIS:=0}" "${SETUP=}" "${CACHE=}"
+    [[ -n $IMAGE ]] || die "no Gemfile in $TOP, so nothing to auto-configure; run 'treepot init' to write $CFG"
   fi
+  [[ -z $CACHE || $CACHE == /* ]] || CACHE=$TOP/$CACHE  # relative = inside the worktree
 
   case $1 in
     up) cmd_up ;;
     status) cmd_status ;;
     down) cmd_down ;;
     destroy) cmd_destroy "${2:-}" ;;
-    build) [[ -z $IMAGE_SET ]] || die "IMAGE is set, so there is nothing to build"; build_image ;;
+    build) [[ -n $BUILD ]] || die "the app image is set in the config, so there is nothing to build"; build_image ;;
     *) cmd_exec "$@" ;;
   esac
 }
