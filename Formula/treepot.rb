@@ -3,6 +3,7 @@ class Treepot < Formula
   homepage "https://github.com/mbroadhead/treepot"
   url "https://github.com/mbroadhead/treepot/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "116c93b9f5e3c794e87b6181695cfc53fa055829a958aa4545db730c4bec0a15"
+  license "MIT"
   head "https://github.com/mbroadhead/treepot.git", branch: "main"
 
   depends_on "container"

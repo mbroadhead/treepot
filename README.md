@@ -123,3 +123,7 @@ Multi-database Rails apps: `DATABASE_URL` only covers the primary, so point the 
 - IPs can change after `treepot down`/`treepot up` or a reboot; `treepot up` rewires the app VM each time. For stable `<name>.test` hostnames see the [container networking docs](https://github.com/apple/container/blob/main/docs/networking.md) (needs sudo).
 - The worktree is mounted at its host path, so `git` works inside the VM, including in linked worktrees.
 - Test the harness itself: `test/detect_test.sh`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
