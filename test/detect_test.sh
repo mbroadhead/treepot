@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Self-check for rv's detection and naming logic. Needs no VM.
+# Self-check for treepot's detection and naming logic. Needs no VM.
 set -euo pipefail
-source "$(dirname "$0")/../bin/rv"
+source "$(dirname "$0")/../bin/treepot"
 
 t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
 fails=0

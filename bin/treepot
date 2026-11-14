@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# rv: run the current git worktree of a Rails app in Apple `container` micro-VMs.
+# treepot: run the current git worktree of a Rails app in Apple `container` micro-VMs.
 set -euo pipefail
 
-RV_HOME="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.." && pwd)"
-RV_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/rv"
+TREEPOT_HOME="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.." && pwd)"
+TREEPOT_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/treepot"
 
-die() { echo "rv: $*" >&2; exit 1; }
+die() { echo "treepot: $*" >&2; exit 1; }
 
 # ---- detection (pure functions of an app dir; covered by test/detect_test.sh) ----
 
@@ -68,7 +68,7 @@ wait_port() { # <ip> <port>; DB images only open TCP once init has finished
 
 build_image() {
   container build -t "$IMAGE" --build-arg "RUBY_VERSION=$RUBY_VERSION" \
-    --build-arg "APT_PACKAGES=${APT_PACKAGES:-}" "$RV_HOME"
+    --build-arg "APT_PACKAGES=${APT_PACKAGES:-}" "$TREEPOT_HOME"
 }
 
 # ---- commands ----
@@ -91,7 +91,7 @@ cmd_up() {
     mysql2|trilogy)
       # --datadir in a subdir for the same lost+found reason.
       ensure_running "$SLUG-db" -e MYSQL_ROOT_PASSWORD=root -e MARIADB_ROOT_PASSWORD=root \
-        -v "$SLUG-dbdata:/var/lib/rv" "${DB_IMAGE:-mysql:8.4}" --datadir=/var/lib/rv/data
+        -v "$SLUG-dbdata:/var/lib/treepot" "${DB_IMAGE:-mysql:8.4}" --datadir=/var/lib/treepot/data
       db_ip=$(ip "$SLUG-db"); wait_port "$db_ip" 3306
       env+=(-e "DATABASE_URL=$DB://root:root@$db_ip" -e "DB_HOST=$db_ip" -e "MYSQL_HOST=$db_ip") ;;
     sqlite) ;;
@@ -115,11 +115,11 @@ cmd_up() {
 
   container exec -w "$TOP" "$SLUG-app" sh -c 'bundle check >/dev/null 2>&1 || bundle install'
   echo "up: $SLUG (ruby $RUBY_VERSION, db $DB)"
-  echo "  rv rails db:prepare && rv rails s   ->   http://$(ip "$SLUG-app"):3000"
+  echo "  treepot rails db:prepare && treepot rails s   ->   http://$(ip "$SLUG-app"):3000"
 }
 
 cmd_exec() {
-  [[ $(state "$SLUG-app") == running ]] || die "$SLUG-app is not running; run 'rv up' first"
+  [[ $(state "$SLUG-app") == running ]] || die "$SLUG-app is not running; run 'treepot up' first"
   local tty=(-i); [[ -t 0 && -t 1 ]] && tty=(-i -t)
   local wd=$PWD; [[ $wd == "$TOP" || $wd == "$TOP"/* ]] || wd=$TOP
   exec container exec "${tty[@]}" -w "$wd" "$SLUG-app" "$@"
@@ -151,14 +151,14 @@ cmd_destroy() {
 
 usage() {
   cat <<EOF
-usage: rv <command>   (run inside any git worktree of a Rails app)
+usage: treepot <command>   (run inside any git worktree of a Rails app)
   up            start this worktree's VMs (app + db [+ redis]) and bundle install
-  <anything>    run it in the app VM, e.g. rv rails s, rv bash, rv bundle add foo
+  <anything>    run it in the app VM, e.g. treepot rails s, treepot bash, treepot bundle add foo
   status        this worktree's VMs, state and IPs
   down          remove the VMs, keep volumes
   destroy [-f]  down + delete the database and gem volumes
   build         (re)build the app image for this Ruby version
-Per-project overrides: $RV_CONFIG/<project>.env  (see README)
+Per-project overrides: $TREEPOT_CONFIG/<project>.env  (see README)
 EOF
 }
 
@@ -167,20 +167,20 @@ main() {
   command -v container >/dev/null || die "Apple 'container' CLI not found (brew install container && container system start)"
 
   TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
-  [[ -f $TOP/Gemfile ]] || die "no Gemfile in $TOP; run rv from a Rails app's worktree"
+  [[ -f $TOP/Gemfile ]] || die "no Gemfile in $TOP; run treepot from a Rails app's worktree"
   COMMON=$(git rev-parse --path-format=absolute --git-common-dir)
   local project; project=$(project_for "$COMMON")
   SLUG=$(slug_for "$TOP" "$project")
 
   # shellcheck disable=SC1090
-  [[ ! -f $RV_CONFIG/$project.env ]] || source "$RV_CONFIG/$project.env"
+  [[ ! -f $TREEPOT_CONFIG/$project.env ]] || source "$TREEPOT_CONFIG/$project.env"
   : "${RUBY_VERSION:=$(detect_ruby "$TOP")}"
   : "${DB:=$(detect_db "$TOP")}"
   [[ $DB != mysql ]] || DB=mysql2
   if [[ -z ${REDIS:-} ]]; then REDIS=0; ! has_gem "$TOP" redis || REDIS=1; fi
   IMAGE_SET=${IMAGE:-}
-  [[ -n $IMAGE_SET || -n $RUBY_VERSION ]] || die "can't detect the Ruby version; set RUBY_VERSION in $RV_CONFIG/$project.env"
-  : "${IMAGE:=rv-ruby:$RUBY_VERSION}"
+  [[ -n $IMAGE_SET || -n $RUBY_VERSION ]] || die "can't detect the Ruby version; set RUBY_VERSION in $TREEPOT_CONFIG/$project.env"
+  : "${IMAGE:=treepot-ruby:$RUBY_VERSION}"
 
   case $1 in
     up) cmd_up ;;

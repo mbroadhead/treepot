@@ -1,4 +1,4 @@
-# rv
+# treepot
 
 Run any Rails app in Apple [`container`](https://github.com/apple/container) micro-VMs. Each git worktree gets its own app VM, database VM and volumes. Nothing is added to the app repo.
 
@@ -6,7 +6,7 @@ Run any Rails app in Apple [`container`](https://github.com/apple/container) mic
 
 ```sh
 brew install container && container system start   # once
-ln -s "$PWD/bin/rv" ~/.local/bin/rv                # any directory on your PATH
+ln -s "$PWD/bin/treepot" ~/.local/bin/treepot                # any directory on your PATH
 ```
 
 ## Use
@@ -14,13 +14,13 @@ ln -s "$PWD/bin/rv" ~/.local/bin/rv                # any directory on your PATH
 From any worktree of a Rails app:
 
 ```sh
-rv up                 # build image, start db (+ redis), start app VM, bundle install
-rv rails db:prepare
-rv rails s            # open the URL that `rv up` printed; every worktree has its own IP on port 3000
-rv bash               # anything that isn't an rv command runs in the app VM
-rv status
-rv down               # remove the VMs, keep the database and gems
-rv destroy            # also delete the volumes; run before `git worktree remove`
+treepot up                 # build image, start db (+ redis), start app VM, bundle install
+treepot rails db:prepare
+treepot rails s            # open the URL that `treepot up` printed; every worktree has its own IP on port 3000
+treepot bash               # anything that isn't an treepot command runs in the app VM
+treepot status
+treepot down               # remove the VMs, keep the database and gems
+treepot destroy            # also delete the volumes; run before `git worktree remove`
 ```
 
 ## What it detects
@@ -31,12 +31,12 @@ rv destroy            # also delete the volumes; run before `git worktree remove
 | Database | `pg` / `mysql2` / `trilogy` in `Gemfile.lock`, else sqlite (no DB VM) | `DB`, `DB_IMAGE` |
 | Redis | `redis` gem in `Gemfile.lock` | `REDIS=0\|1`, `REDIS_IMAGE` |
 
-Overrides go in `~/.config/rv/<project>.env`, where `<project>` is the main repo's directory name:
+Overrides go in `~/.config/treepot/<project>.env`, where `<project>` is the main repo's directory name:
 
 ```sh
-# ~/.config/rv/shop.env
+# ~/.config/treepot/shop.env
 DB_IMAGE=mariadb:11          # default: postgres:17 or mysql:8.4
-APT_PACKAGES="libvips-dev"   # extra packages for the app image; run `rv build` after changing
+APT_PACKAGES="libvips-dev"   # extra packages for the app image; run `treepot build` after changing
 IMAGE=my/custom:image        # skip the built image entirely (use for Rubies too old for the Dockerfile)
 CPUS=8 MEMORY=8G             # default: 4 / 4G
 ```
@@ -49,6 +49,6 @@ Multi-database apps: `DATABASE_URL` only covers the primary, so point the other 
 
 ## Notes
 
-- IPs can change after `rv down`/`rv up` or a reboot; `rv up` rewires the app VM each time. For stable `<name>.test` hostnames see the [container networking docs](https://github.com/apple/container/blob/main/docs/networking.md) (needs sudo).
+- IPs can change after `treepot down`/`treepot up` or a reboot; `treepot up` rewires the app VM each time. For stable `<name>.test` hostnames see the [container networking docs](https://github.com/apple/container/blob/main/docs/networking.md) (needs sudo).
 - The worktree is mounted at its host path, so `git` works inside the VM, including in linked worktrees.
 - Test the harness itself: `test/detect_test.sh`.
