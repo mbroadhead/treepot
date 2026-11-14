@@ -107,11 +107,17 @@ dns_domains() { container system dns list 2>/dev/null | awk 'NR>1{print $1}' | j
 addr() { container inspect "$1" | jq -r --argjson d "$(dns_domains)" "$JQ_ADDR .[0] | addr"; }
 
 # Everything treepot creates is labelled with the worktree's slug, so status/down/destroy never depend on the current config.
+# A VM whose settings changed since it was created (different treepot.spec) is replaced; its volumes are kept.
 ensure_running() { # <name> <container run args...>
-  local name=$1; shift
-  case "$(state "$name")" in
+  local name=$1 spec st; shift
+  spec=$(printf '%s\n' "$@" | shasum | cut -c1-12)
+  st=$(state "$name")
+  if [[ -n $st && $(container inspect "$name" | jq -r '.[0].configuration.labels["treepot.spec"] // ""') != "$spec" ]]; then
+    container rm -f "$name" >/dev/null; st=""
+  fi
+  case $st in
     running) ;;
-    "") container run -d --name "$name" -l "treepot=$SLUG" "$@" >/dev/null ;;
+    "") container run -d --name "$name" -l "treepot=$SLUG" -l "treepot.spec=$spec" "$@" >/dev/null ;;
     *) container start "$name" >/dev/null ;;
   esac
 }
@@ -196,6 +202,10 @@ cmd_up() {
   if [[ -n $BUILD ]] && ! container image inspect "$IMAGE" >/dev/null 2>&1; then build_image; fi
 
   for s in $SERVICES; do start_service "$s"; done
+  # Services dropped from the config: remove their VMs (data volumes stay until destroy).
+  for s in $(container ls -a --format json | jq -r --arg s "$SLUG" '.[] | select(.configuration.labels.treepot == $s) | .configuration.id | ltrimstr($s + "-")'); do
+    [[ $s == app || " $(echo $SERVICES) " == *" $s "* ]] || { container rm -f "$SLUG-$s" >/dev/null; echo "removed: $s (no longer configured)"; }
+  done
   while IFS= read -r kv; do [[ -z $kv ]] || APP_ARGS+=(-e "$kv"); done < <(cfg_all app.env)
 
   # Same absolute paths as the host: a linked worktree's .git file points at the main repo by absolute path.
@@ -229,10 +239,12 @@ cmd_exec() {
 }
 
 cmd_status() {
-  container ls -a --format json | jq -r --arg s "$SLUG" --argjson d "$(dns_domains)" "$JQ_ADDR"'
+  local rows
+  rows=$(container ls -a --format json | jq -r --arg s "$SLUG" --argjson d "$(dns_domains)" "$JQ_ADDR"'
     .[] | select(.configuration.labels.treepot == $s)
     | [(.configuration.id | ltrimstr($s + "-")), .status.state, addr] | @tsv' \
-    | sort | awk -F'\t' '{printf "%-12s %-8s %s\n", $1, $2, $3}'
+    | sort | awk -F'\t' '{printf "%-12s %-8s %s\n", $1, $2, $3}')
+  if [[ -n $rows ]]; then echo "$rows"; else echo "no VMs for $SLUG; run 'treepot up' to start them"; fi
 }
 
 cmd_down() {
@@ -240,7 +252,7 @@ cmd_down() {
   for c in $(container ls -a --format json | jq -r --arg s "$SLUG" '.[] | select(.configuration.labels.treepot == $s) | .configuration.id'); do
     container rm -f "$c" >/dev/null
   done
-  echo "down: $SLUG (volumes kept)"
+  echo "down: $SLUG (data kept; 'treepot up' starts it again, 'treepot destroy' also deletes the data)"
 }
 
 cmd_destroy() {
@@ -249,11 +261,29 @@ cmd_destroy() {
     read -r -p "Delete $SLUG's VMs AND its data + dependency volumes? [y/N] " a
     [[ $a == y || $a == Y ]] || die "aborted"
   fi
-  cmd_down
+  cmd_down >/dev/null
   for v in $(container volume ls --format json | jq -r --arg s "$SLUG" '.[] | select(.configuration.labels.treepot == $s) | .id'); do
     container volume rm "$v" >/dev/null
   done
-  echo "destroyed: $SLUG"
+  echo "destroyed: $SLUG (VMs and data); 'treepot up' starts fresh"
+}
+
+cmd_config() { # [path]: open this project's config in $EDITOR
+  if [[ ${1:-} == path ]]; then echo "$CFG"; return; fi
+  if [[ ! -f $CFG ]]; then
+    [[ -f $TOP/Gemfile ]] || die "no config yet; run 'treepot init' first"
+    # Ruby projects are auto-detected, so their config starts empty and holds only overrides.
+    mkdir -p "$TREEPOT_CONFIG"
+    printf '# treepot overrides for %s. Everything is detected unless set here; see "Config reference" in the README.\n# [app]\n#     ruby = 3.4.1\n#     apt = libvips-dev\n#\n# [service "postgres"]\n#     image = postgres:16\n' "$(basename "$CFG" .ini)" > "$CFG"
+  fi
+  local before; before=$(shasum < "$CFG")
+  ${VISUAL:-${EDITOR:-vi}} "$CFG"
+  git config -f "$CFG" --list >/dev/null || die "$CFG has a syntax error (see above); run 'treepot config' to fix it"
+  if [[ $(shasum < "$CFG") == "$before" ]]; then
+    echo "no changes to $CFG"
+  else
+    echo "saved $CFG; run 'treepot up' to apply"
+  fi
 }
 
 dns_configured() { # the domain container registers VMs under, or nothing
@@ -334,6 +364,7 @@ usage: treepot <command>   (run anywhere inside your project; each git worktree 
   destroy [-f]  down + delete the data and dependency volumes
   init [template] [--with postgres,mysql,redis|none]
                 write a starter config; picks the template and services from the project if not given
+  config [path] edit this project's config in \$EDITOR ('config path' prints its location); 'treepot up' applies it
   dns [domain]  one-time setup of stable names (<worktree>-app.test) instead of IPs; 'dns status' to check
   build         (re)build the app image for this Ruby version (Ruby apps only)
 Rails apps need no config. Anything else, and any override: $TREEPOT_CONFIG/<project>.ini  (see README)
@@ -357,6 +388,7 @@ main() {
   CFG=$TREEPOT_CONFIG/$project.ini
 
   if [[ $1 == init ]]; then shift; cmd_init "$@"; exit; fi
+  if [[ $1 == config ]]; then shift; cmd_config "$@"; exit; fi
   [[ ! -f $CFG ]] || git config -f "$CFG" --list >/dev/null || die "can't parse $CFG"
   [[ -f $CFG || ! -f ${CFG%.ini}.env ]] || die "${CFG%.ini}.env is the old config format; delete it and run 'treepot init'"
 

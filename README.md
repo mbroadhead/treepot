@@ -22,6 +22,7 @@ From any worktree of your project:
 ```sh
 treepot init              # not needed for Rails; writes ~/.config/treepot/<project>.ini
 treepot up                # start services and the app VM, install dependencies
+treepot config            # edit the config in $EDITOR; the next `treepot up` applies it
 treepot rails s           # anything that isn't a treepot command runs in the app VM
 treepot bash
 treepot status
@@ -142,7 +143,21 @@ For every service, the app VM gets:
 - **Rails** (a `config/database.yml` exists): the URLs carry host and credentials only, so `database.yml` still names separate development and test databases. For a second database, point its `database.yml` entry at `ENV["MYSQL_URL"]` or `ENV["POSTGRES_URL"]`.
 - **Everything else:** the URLs point at a ready-made database called `app`.
 
-Services keep running across `treepot up`; only the app VM is recreated. After changing a service's settings, run `treepot down` then `treepot up`.
+## Changing the config
+
+```sh
+treepot config    # opens ~/.config/treepot/<project>.ini in $EDITOR and checks the syntax when you save
+treepot up        # applies it
+```
+
+`treepot up` works out what changed, so there is no need for `down` first:
+
+- **App VM:** recreated on every `up`, so `[app]` changes always apply. Installed dependencies are kept in the `cache` volume.
+- **A service whose settings changed:** its VM is replaced. Its data volume is kept.
+- **A service you removed:** its VM is removed. Its data volume stays until `treepot destroy`.
+- **Unchanged services:** left running.
+
+`treepot config path` prints the file's location. For a Rails app with no config yet, `treepot config` creates one containing only commented-out examples.
 
 ## Stable names instead of IP addresses
 
