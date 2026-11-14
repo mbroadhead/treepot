@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# treepot: run the current git worktree of a Rails app in Apple `container` micro-VMs.
+# treepot: run the current git worktree of a project (Rails auto-detected, anything else via config) in Apple `container` micro-VMs.
 set -euo pipefail
 
 TREEPOT_HOME="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -76,26 +76,29 @@ build_image() {
 cmd_up() {
   local env=(-e BINDING=0.0.0.0
     -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e "GIT_CONFIG_VALUE_0=*")
-  local db_ip
+  local db_ip kv
+  # Rails names its databases in database.yml; everything else gets a ready-made "app" database in the URL.
+  local dbname=/app; [[ ! -f $TOP/config/database.yml ]] || dbname=""
+  for kv in ${APP_ENV[@]+"${APP_ENV[@]}"}; do env+=(-e "$kv"); done
 
   if [[ -z ${IMAGE_SET:-} ]] && ! container image inspect "$IMAGE" >/dev/null 2>&1; then build_image; fi
 
   case $DB in
     postgres)
       # PGDATA in a subdir: a fresh volume's lost+found makes initdb refuse the mount root.
-      ensure_running "$SLUG-db" -e POSTGRES_PASSWORD=postgres -e PGDATA=/var/lib/postgresql/data/pgdata \
+      ensure_running "$SLUG-db" -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=app -e PGDATA=/var/lib/postgresql/data/pgdata \
         -v "$SLUG-dbdata:/var/lib/postgresql/data" "${DB_IMAGE:-postgres:17}"
       db_ip=$(ip "$SLUG-db"); wait_port "$db_ip" 5432
-      env+=(-e "DATABASE_URL=postgres://postgres:postgres@$db_ip" -e "DB_HOST=$db_ip"
+      env+=(-e "DATABASE_URL=postgresql://postgres:postgres@$db_ip$dbname" -e "DB_HOST=$db_ip"
         -e "PGHOST=$db_ip" -e PGUSER=postgres -e PGPASSWORD=postgres) ;;
-    mysql2|trilogy)
+    mysql|mysql2|trilogy)
       # --datadir in a subdir for the same lost+found reason.
-      ensure_running "$SLUG-db" -e MYSQL_ROOT_PASSWORD=root -e MARIADB_ROOT_PASSWORD=root \
+      ensure_running "$SLUG-db" -e MYSQL_ROOT_PASSWORD=root -e MARIADB_ROOT_PASSWORD=root -e MYSQL_DATABASE=app \
         -v "$SLUG-dbdata:/var/lib/treepot" "${DB_IMAGE:-mysql:8.4}" --datadir=/var/lib/treepot/data
       db_ip=$(ip "$SLUG-db"); wait_port "$db_ip" 3306
-      env+=(-e "DATABASE_URL=$DB://root:root@$db_ip" -e "DB_HOST=$db_ip" -e "MYSQL_HOST=$db_ip") ;;
-    sqlite) ;;
-    *) die "unknown DB '$DB' (postgres, mysql2, trilogy, sqlite)" ;;
+      env+=(-e "DATABASE_URL=$DB://root:root@$db_ip$dbname" -e "DB_HOST=$db_ip" -e "MYSQL_HOST=$db_ip") ;;
+    sqlite|none) ;;
+    *) die "unknown DB '$DB' (postgres, mysql, mysql2, trilogy, none)" ;;
   esac
 
   if [[ $REDIS == 1 ]]; then
@@ -106,16 +109,21 @@ cmd_up() {
   # Same absolute paths as the host: a linked worktree's .git file points at the main repo by absolute path.
   local mounts=(-v "$TOP:$TOP")
   [[ $COMMON == "$TOP"/* ]] || mounts+=(-v "$COMMON:$COMMON")
+  [[ -z $CACHE ]] || mounts+=(-v "$SLUG-cache:$CACHE")
 
   # Recreated every time so the DB/redis IPs baked into its env are never stale.
   container rm -f "$SLUG-app" >/dev/null 2>&1 || true
   container run -d --name "$SLUG-app" -c "${CPUS:-4}" -m "${MEMORY:-4G}" \
-    "${mounts[@]}" -v "$SLUG-bundle:/usr/local/bundle" -w "$TOP" "${env[@]}" \
+    "${mounts[@]}" -w "$TOP" "${env[@]}" \
     "$IMAGE" sleep infinity >/dev/null
 
-  container exec -w "$TOP" "$SLUG-app" sh -c 'bundle check >/dev/null 2>&1 || bundle install'
-  echo "up: $SLUG (ruby $RUBY_VERSION, db $DB)"
-  echo "  treepot rails db:prepare && treepot rails s   ->   http://$(ip "$SLUG-app"):3000"
+  [[ -z $SETUP ]] || container exec -w "$TOP" "$SLUG-app" sh -c "$SETUP"
+  echo "up: $SLUG (image $IMAGE, db $DB)"
+  if [[ -f $TOP/Gemfile ]]; then
+    echo "  treepot rails db:prepare && treepot rails s   ->   http://$(ip "$SLUG-app"):3000"
+  else
+    echo "  run commands with 'treepot <command>'; a server bound to 0.0.0.0 is reachable at $(ip "$SLUG-app")"
+  fi
 }
 
 cmd_exec() {
@@ -141,24 +149,34 @@ cmd_down() {
 
 cmd_destroy() {
   if [[ ${1:-} != -f ]]; then
-    read -r -p "Delete $SLUG's VMs AND its database + gem volumes? [y/N] " a
+    read -r -p "Delete $SLUG's VMs AND its database + dependency volumes? [y/N] " a
     [[ $a == y || $a == Y ]] || die "aborted"
   fi
   cmd_down
-  container volume rm "$SLUG-bundle" "$SLUG-dbdata" >/dev/null 2>&1 || true
+  local v
+  for v in cache dbdata bundle; do container volume rm "$SLUG-$v" >/dev/null 2>&1 || true; done  # bundle: pre-generic-mode name
   echo "destroyed: $SLUG"
+}
+
+cmd_init() { # <template>: copy a starter config for this project
+  local ex=$TREEPOT_HOME/examples
+  [[ -n ${1:-} && -f $ex/$1.env ]] || die "usage: treepot init <template>; templates: $(cd "$ex" && ls ./*.env | sed 's|^\./||; s|\.env$||' | tr '\n' ' ')"
+  [[ ! -e $CFG ]] || die "$CFG already exists"
+  mkdir -p "$TREEPOT_CONFIG" && cp "$ex/$1.env" "$CFG"
+  echo "wrote $CFG; review it, then run 'treepot up'"
 }
 
 usage() {
   cat <<EOF
-usage: treepot <command>   (run inside any git worktree of a Rails app)
-  up            start this worktree's VMs (app + db [+ redis]) and bundle install
-  <anything>    run it in the app VM, e.g. treepot rails s, treepot bash, treepot bundle add foo
+usage: treepot <command>   (run inside any git worktree of your app)
+  up            start this worktree's VMs (app + db [+ redis]) and install dependencies
+  <anything>    run it in the app VM, e.g. treepot rails s, treepot bash, treepot uv run pytest
   status        this worktree's VMs, state and IPs
   down          remove the VMs, keep volumes
-  destroy [-f]  down + delete the database and gem volumes
-  build         (re)build the app image for this Ruby version
-Per-project overrides: $TREEPOT_CONFIG/<project>.env  (see README)
+  destroy [-f]  down + delete the database and dependency volumes
+  init <name>   write a starter config for a non-Ruby app (run 'treepot init' to list templates)
+  build         (re)build the app image for this Ruby version (Ruby apps only)
+Ruby/Rails apps are auto-detected. Anything else, and any override: $TREEPOT_CONFIG/<project>.env  (see README)
 EOF
 }
 
@@ -167,27 +185,35 @@ main() {
   command -v container >/dev/null || die "Apple 'container' CLI not found (brew install container && container system start)"
 
   TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
-  [[ -f $TOP/Gemfile ]] || die "no Gemfile in $TOP; run treepot from a Rails app's worktree"
   COMMON=$(git rev-parse --path-format=absolute --git-common-dir)
   local project; project=$(project_for "$COMMON")
   SLUG=$(slug_for "$TOP" "$project")
 
-  # shellcheck disable=SC1090
-  [[ ! -f $TREEPOT_CONFIG/$project.env ]] || source "$TREEPOT_CONFIG/$project.env"
-  : "${RUBY_VERSION:=$(detect_ruby "$TOP")}"
-  : "${DB:=$(detect_db "$TOP")}"
-  [[ $DB != mysql ]] || DB=mysql2
-  if [[ -z ${REDIS:-} ]]; then REDIS=0; ! has_gem "$TOP" redis || REDIS=1; fi
+  # shellcheck disable=SC1090  # the config may use $TOP
+  CFG=$TREEPOT_CONFIG/$project.env
+  if [[ $1 == init ]]; then cmd_init "${2:-}"; exit; fi
+  [[ ! -f $CFG ]] || source "$CFG"
   IMAGE_SET=${IMAGE:-}
-  [[ -n $IMAGE_SET || -n $RUBY_VERSION ]] || die "can't detect the Ruby version; set RUBY_VERSION in $TREEPOT_CONFIG/$project.env"
-  : "${IMAGE:=treepot-ruby:$RUBY_VERSION}"
+  if [[ -f $TOP/Gemfile ]]; then
+    : "${RUBY_VERSION:=$(detect_ruby "$TOP")}"
+    : "${DB:=$(detect_db "$TOP")}"
+    [[ $DB != mysql ]] || DB=mysql2  # the URL scheme Rails expects
+    if [[ -z ${REDIS:-} ]]; then REDIS=0; ! has_gem "$TOP" redis || REDIS=1; fi
+    [[ -n $IMAGE_SET || -n $RUBY_VERSION ]] || die "can't detect the Ruby version; set RUBY_VERSION in $CFG"
+    : "${IMAGE:=treepot-ruby:$RUBY_VERSION}"
+    : "${SETUP=bundle check >/dev/null 2>&1 || bundle install}"
+    : "${CACHE=/usr/local/bundle}"
+  else
+    [[ -n $IMAGE_SET ]] || die "no Gemfile in $TOP, so nothing to auto-detect; for a non-Ruby app run 'treepot init <template>' (run 'treepot init' to list them) or write $CFG by hand"
+    : "${DB:=none}" "${REDIS:=0}" "${SETUP=}" "${CACHE=}"
+  fi
 
   case $1 in
     up) cmd_up ;;
     status) cmd_status ;;
     down) cmd_down ;;
     destroy) cmd_destroy "${2:-}" ;;
-    build) build_image ;;
+    build) [[ -z $IMAGE_SET ]] || die "IMAGE is set, so there is nothing to build"; build_image ;;
     *) cmd_exec "$@" ;;
   esac
 }
