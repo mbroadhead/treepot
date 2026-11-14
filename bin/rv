@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# rv: run the current git worktree of a Rails app in Apple `container` micro-VMs.
+set -euo pipefail
+
+RV_HOME="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+die() { echo "rv: $*" >&2; exit 1; }
+
+# ---- detection (pure functions of an app dir; covered by test/detect_test.sh) ----
+
+detect_ruby() {
+  local d=$1 v=""
+  if [[ -f $d/.ruby-version ]]; then
+    v=$(tr -d '[:space:]' < "$d/.ruby-version"); v=${v#ruby-}
+  elif [[ -f $d/.tool-versions ]]; then
+    v=$(awk '$1=="ruby"{print $2; exit}' "$d/.tool-versions")
+  elif [[ -f $d/Gemfile.lock ]]; then
+    v=$(awk '/^RUBY VERSION/{getline; print $2; exit}' "$d/Gemfile.lock"); v=${v%%p[0-9]*}
+  fi
+  echo "$v"
+}
+
+has_gem() { [[ -f $1/Gemfile.lock ]] && grep -Eq "^    $2 \(" "$1/Gemfile.lock"; }
+
+# Prints the DATABASE_URL scheme: postgres | mysql2 | trilogy | sqlite
+detect_db() {
+  if has_gem "$1" pg; then echo postgres
+  elif has_gem "$1" mysql2; then echo mysql2
+  elif has_gem "$1" trilogy; then echo trilogy
+  else echo sqlite; fi
+}
+
+project_for() { # <git common dir>
+  if [[ $(basename "$1") == .git ]]; then basename "$(dirname "$1")"; else basename "$1" .git; fi
+}
+
+# shortcut: two worktrees of one project with the same directory name collide; add a path hash if that ever happens.
+slug_for() { # <worktree top> <project>
+  local wt s=$2
+  wt=$(basename "$1")
+  if [[ $wt == "$2" || $wt == "$2"-* ]]; then s=$wt; else s="$2-$wt"; fi
+  printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-'
+}
+
+# ---- container helpers ----
+
+state() { container inspect "$1" 2>/dev/null | jq -r '.[0].status.state // empty' 2>/dev/null || true; }
+ip() { container inspect "$1" | jq -r '.[0].status.networks[0].ipv4Address' | cut -d/ -f1; }
+
+ensure_running() { # <name> <container run args...>
+  local name=$1; shift
+  case "$(state "$name")" in
+    running) ;;
+    "") container run -d --name "$name" "$@" >/dev/null ;;
+    *) container start "$name" >/dev/null ;;
+  esac
+}
+
+wait_port() { # <ip> <port>; DB images only open TCP once init has finished
+  local i
+  for i in $(seq 60); do
+    (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && return 0
+    sleep 1
+  done
+  die "nothing listening on $1:$2 after 60s"
+}
+
+build_image() {
+  container build -t "$IMAGE" --build-arg "RUBY_VERSION=$RUBY_VERSION" \
+    --build-arg "APT_PACKAGES=${APT_PACKAGES:-}" "$RV_HOME"
+}
+
+# ---- commands ----
+
+cmd_up() {
+  local env=(-e BINDING=0.0.0.0
+    -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e "GIT_CONFIG_VALUE_0=*")
+  local db_ip
+
+  if [[ -z ${IMAGE_SET:-} ]] && ! container image inspect "$IMAGE" >/dev/null 2>&1; then build_image; fi
+
+  case $DB in
+    postgres)
+      # PGDATA in a subdir: a fresh volume's lost+found makes initdb refuse the mount root.
+      ensure_running "$SLUG-db" -e POSTGRES_PASSWORD=postgres -e PGDATA=/var/lib/postgresql/data/pgdata \
+        -v "$SLUG-dbdata:/var/lib/postgresql/data" "${DB_IMAGE:-postgres:17}"
+      db_ip=$(ip "$SLUG-db"); wait_port "$db_ip" 5432
+      env+=(-e "DATABASE_URL=postgres://postgres:postgres@$db_ip" -e "DB_HOST=$db_ip"
+        -e "PGHOST=$db_ip" -e PGUSER=postgres -e PGPASSWORD=postgres) ;;
+    mysql2|trilogy)
+      # --datadir in a subdir for the same lost+found reason.
+      ensure_running "$SLUG-db" -e MYSQL_ROOT_PASSWORD=root -e MARIADB_ROOT_PASSWORD=root \
+        -v "$SLUG-dbdata:/var/lib/rv" "${DB_IMAGE:-mysql:8.4}" --datadir=/var/lib/rv/data
+      db_ip=$(ip "$SLUG-db"); wait_port "$db_ip" 3306
+      env+=(-e "DATABASE_URL=$DB://root:root@$db_ip" -e "DB_HOST=$db_ip" -e "MYSQL_HOST=$db_ip") ;;
+    sqlite) ;;
+    *) die "unknown DB '$DB' (postgres, mysql2, trilogy, sqlite)" ;;
+  esac
+
+  if [[ $REDIS == 1 ]]; then
+    ensure_running "$SLUG-redis" "${REDIS_IMAGE:-redis:7}"
+    env+=(-e "REDIS_URL=redis://$(ip "$SLUG-redis"):6379/0")
+  fi
+
+  # Same absolute paths as the host: a linked worktree's .git file points at the main repo by absolute path.
+  local mounts=(-v "$TOP:$TOP")
+  [[ $COMMON == "$TOP"/* ]] || mounts+=(-v "$COMMON:$COMMON")
+
+  # Recreated every time so the DB/redis IPs baked into its env are never stale.
+  container rm -f "$SLUG-app" >/dev/null 2>&1 || true
+  container run -d --name "$SLUG-app" -c "${CPUS:-4}" -m "${MEMORY:-4G}" \
+    "${mounts[@]}" -v "$SLUG-bundle:/usr/local/bundle" -w "$TOP" "${env[@]}" \
+    "$IMAGE" sleep infinity >/dev/null
+
+  container exec -w "$TOP" "$SLUG-app" sh -c 'bundle check >/dev/null 2>&1 || bundle install'
+  echo "up: $SLUG (ruby $RUBY_VERSION, db $DB)"
+  echo "  rv rails db:prepare && rv rails s   ->   http://$(ip "$SLUG-app"):3000"
+}
+
+cmd_exec() {
+  [[ $(state "$SLUG-app") == running ]] || die "$SLUG-app is not running; run 'rv up' first"
+  local tty=(-i); [[ -t 0 && -t 1 ]] && tty=(-i -t)
+  local wd=$PWD; [[ $wd == "$TOP" || $wd == "$TOP"/* ]] || wd=$TOP
+  exec container exec "${tty[@]}" -w "$wd" "$SLUG-app" "$@"
+}
+
+cmd_status() {
+  container ls -a --format json | jq -r --arg s "$SLUG" '
+    .[] | select(.configuration.id == ($s+"-app") or .configuration.id == ($s+"-db") or .configuration.id == ($s+"-redis"))
+    | [.configuration.id, .status.state, (.status.networks[0].ipv4Address // "-" | split("/")[0])] | @tsv'
+}
+
+cmd_down() {
+  local c
+  for c in app db redis; do
+    [[ -z $(state "$SLUG-$c") ]] || container rm -f "$SLUG-$c" >/dev/null
+  done
+  echo "down: $SLUG (volumes kept)"
+}
+
+cmd_destroy() {
+  if [[ ${1:-} != -f ]]; then
+    read -r -p "Delete $SLUG's VMs AND its database + gem volumes? [y/N] " a
+    [[ $a == y || $a == Y ]] || die "aborted"
+  fi
+  cmd_down
+  container volume rm "$SLUG-bundle" "$SLUG-dbdata" >/dev/null 2>&1 || true
+  echo "destroyed: $SLUG"
+}
+
+usage() {
+  cat <<EOF
+usage: rv <command>   (run inside any git worktree of a Rails app)
+  up            start this worktree's VMs (app + db [+ redis]) and bundle install
+  <anything>    run it in the app VM, e.g. rv rails s, rv bash, rv bundle add foo
+  status        this worktree's VMs, state and IPs
+  down          remove the VMs, keep volumes
+  destroy [-f]  down + delete the database and gem volumes
+  build         (re)build the app image for this Ruby version
+Per-project overrides: $RV_HOME/projects/<project>.env  (see README)
+EOF
+}
+
+main() {
+  [[ $# -gt 0 && $1 != -h && $1 != --help && $1 != help ]] || { usage; exit 0; }
+  command -v container >/dev/null || die "Apple 'container' CLI not found (brew install container && container system start)"
+
+  TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
+  COMMON=$(git rev-parse --path-format=absolute --git-common-dir)
+  local project; project=$(project_for "$COMMON")
+  SLUG=$(slug_for "$TOP" "$project")
+
+  # shellcheck disable=SC1090
+  [[ ! -f $RV_HOME/projects/$project.env ]] || source "$RV_HOME/projects/$project.env"
+  : "${RUBY_VERSION:=$(detect_ruby "$TOP")}"
+  : "${DB:=$(detect_db "$TOP")}"
+  [[ $DB != mysql ]] || DB=mysql2
+  if [[ -z ${REDIS:-} ]]; then REDIS=0; ! has_gem "$TOP" redis || REDIS=1; fi
+  IMAGE_SET=${IMAGE:-}
+  [[ -n $IMAGE_SET || -n $RUBY_VERSION ]] || die "can't detect the Ruby version; set RUBY_VERSION in $RV_HOME/projects/$project.env"
+  : "${IMAGE:=rv-ruby:$RUBY_VERSION}"
+
+  case $1 in
+    up) cmd_up ;;
+    status) cmd_status ;;
+    down) cmd_down ;;
+    destroy) cmd_destroy "${2:-}" ;;
+    build) build_image ;;
+    *) cmd_exec "$@" ;;
+  esac
+}
+
+[[ ${BASH_SOURCE[0]} != "$0" ]] || main "$@"
