@@ -73,12 +73,19 @@ eq "$(find_root "$t/proj/frontend/src" "$t/cfgs")" "$t/proj" "an initialised pro
 eq "$(find_root "$t/bare/sub" "$t/cfgs")" "$t/bare/sub" "no markers at all -> the directory itself"
 eq "$(HOME=$t/proj find_root "$t/proj/t" "$t/cfgs")" "$t/proj/t" "HOME is never a project root"
 
-vm() { printf '{"status":{"networks":[{"hostname":"%s","ipv4Address":"192.168.64.5/24"}]}}' "$1"; }
+vm() { printf '{"configuration":{"labels":{%s}},"status":{"networks":[{"ipv4Address":"192.168.64.5/24"}]}}' "$1"; }
 ad() { vm "$1" | jq -r --argjson d "$2" "$JQ_ADDR addr"; }
-eq "$(ad shop-app.test. '["test"]')" shop-app.test "DNS name when its domain is resolvable from the Mac"
-eq "$(ad shop-app.test. '[]')" 192.168.64.5 "IP when the domain is not registered on the Mac"
-eq "$(ad shop-app '["test"]')" 192.168.64.5 "IP when the VM has no domain"
-eq "$(ad shop-app.dev. '["test"]')" 192.168.64.5 "IP when the VM's domain is a different one"
-eq "$(echo '{"status":{"networks":[]}}' | jq -r --argjson d '[]' "$JQ_ADDR addr")" "-" "stopped VM has no address"
+eq "$(ad '"treepot.host":"feature.shop.test"' '["test"]')" feature.shop.test "DNS name while its domain is resolvable from the Mac"
+eq "$(ad '"treepot.host":"feature.shop.test"' '[]')" 192.168.64.5 "IP once the domain is no longer registered"
+eq "$(ad '"treepot.host":"feature.shop.vm"' '["test"]')" 192.168.64.5 "IP when the name is under a different domain"
+eq "$(ad '' '["test"]')" 192.168.64.5 "IP for a VM created without a name"
+eq "$(echo '{"configuration":{"labels":{}},"status":{"networks":[]}}' | jq -r --argjson d '[]' "$JQ_ADDR addr")" "-" "stopped VM has no address"
+
+eq "$(host_for shop shop test)" shop.test "main worktree is the bare project name"
+eq "$(host_for shop-feature shop test)" feature.shop.test "linked worktree is a subdomain of the project"
+eq "$(host_for "$(slug_for /src/wt/login-fix shop)" shop test)" login-fix.shop.test "worktree dir without the project prefix"
+eq "$(host_for "$(slug_for /src/My_App My_App)" My_App vm)" my-app.vm "project name is made DNS-safe"
+eq "$(host_for "$(slug_for /src/My_App-x.y My_App)" My_App vm)" x-y.my-app.vm "worktree name is made DNS-safe"
+eq "$(apex_for My_App vm)" my-app.vm "apex name from a project name that needs sanitising"
 
 exit $fails

@@ -167,7 +167,17 @@ By default `treepot` shows IP addresses, and they change whenever a VM is recrea
 treepot dns
 ```
 
-From then on `treepot up` and `treepot status` show names such as `myapp-feature-app.test` and `myapp-feature-postgres.test`, usable from your Mac's browser and database tools. The pattern is `<project>-<worktree>-<service>.<domain>`.
+From then on `treepot up` and `treepot status` show names, usable from your Mac's browser and database tools:
+
+| VM | Name |
+|---|---|
+| App in the main worktree | `myapp.test` |
+| App in a linked worktree | `feature.myapp.test` |
+| A service | `postgres.myapp.test`, `postgres.feature.myapp.test` |
+
+The worktree part is the worktree's directory name with the project prefix removed (`myapp-feature` becomes `feature`). The app VM gets its own name in `TREEPOT_HOST`. Existing VMs pick up their names on the next `treepot up`.
+
+macOS remembers failed lookups for a while, so a name you tried before its VM existed can keep failing briefly.
 
 What the command does:
 
@@ -185,6 +195,38 @@ sudo container system dns create test
 ```
 
 To undo it: remove the `[dns]` lines, restart `container`, and run `sudo container system dns delete test`.
+
+## HTTPS
+
+One certificate per project covers the app in every worktree, because they all sit under the same name. With names set up (above) and [`mkcert`](https://github.com/FiloSottile/mkcert) installed (`brew install mkcert`):
+
+```sh
+treepot cert      # once per project
+treepot up
+```
+
+`treepot cert` creates a certificate for `myapp.test` and `*.myapp.test`, trusted by the browsers on your Mac. The first time, it asks before adding mkcert's local certificate authority to your Mac's trusted roots. The files are stored in `~/.config/treepot/certs/<project>/` and mounted read-only into the app VM:
+
+| Variable in the app VM | Value |
+|---|---|
+| `TREEPOT_HOST` | this worktree's name, such as `feature.myapp.test` |
+| `TREEPOT_TLS_CERT` | `/etc/treepot/tls/cert.pem` |
+| `TREEPOT_TLS_KEY` | `/etc/treepot/tls/key.pem` |
+
+`treepot` does not terminate TLS itself: point your server at those files. Each VM has its own address, so it can use port 443 and the URL needs no port. The same command then works in every worktree:
+
+```sh
+# Mojolicious (needs IO::Socket::SSL in the cpanfile)
+treepot sh -c 'perl app.pl daemon -l "https://0.0.0.0:443?cert=$TREEPOT_TLS_CERT&key=$TREEPOT_TLS_KEY"'
+
+# Rails
+treepot sh -c 'bin/rails s -b "ssl://0.0.0.0:443?cert=$TREEPOT_TLS_CERT&key=$TREEPOT_TLS_KEY"'
+```
+
+The variables are set inside the VM, so they must be expanded there: hence `sh -c` with single quotes.
+
+- **Services are not covered.** A wildcard matches one level, so `postgres.feature.myapp.test` is outside `*.myapp.test`.
+- **Rails and subdomains:** Rails only allows one level under `.test` by default. `treepot` sets `RAILS_DEVELOPMENT_HOSTS` so `feature.myapp.test` is accepted.
 
 ## CLI tools and libraries
 

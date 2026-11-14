@@ -19,7 +19,7 @@ class Treepot < Formula
     <<~EOS
       Start Apple's container service once before first use:
         container system start
-      For stable hostnames (<worktree>-app.test) instead of IP addresses, run once:
+      For stable hostnames (myapp.test, feature.myapp.test) instead of IP addresses, run once:
         treepot dns
     EOS
   end

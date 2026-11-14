@@ -79,6 +79,14 @@ slug_for() { # <worktree top> <project>
   printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-'
 }
 
+# DNS name of a worktree's app VM: <project>.<domain> for the main worktree, <worktree>.<project>.<domain> otherwise.
+# Services are <service>.<that name>. One wildcard certificate for *.<project>.<domain> covers every worktree's app.
+host_for() { # <slug> <project> <domain>
+  local p; p=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-')
+  if [[ $1 == "$p" ]]; then echo "$p.$3"; else echo "${1#"$p"-}.$p.$3"; fi
+}
+apex_for() { host_for "$(slug_for "/$1" "$1")" "$1" "$2"; } # <project> <domain>: the main worktree's name
+
 # ---- config: an INI file read with git's own parser ($CFG may not exist) ----
 
 cfg() { [[ ! -f $CFG ]] || git config -f "$CFG" --get "$1" || true; }
@@ -98,13 +106,21 @@ preset_image() {
 state() { container inspect "$1" 2>/dev/null | jq -r '.[0].status.state // empty' 2>/dev/null || true; }
 ip() { container inspect "$1" | jq -r '.[0].status.networks[0].ipv4Address' | cut -d/ -f1; }
 
-# jq: the address to show for a VM. Its DNS name when Apple container's local DNS covers it
-# ($d = domains the Mac can resolve, from `container system dns list`), otherwise its IP.
-JQ_ADDR='def addr: (.status.networks[0] // {}) as $n | (($n.hostname // "") | rtrimstr(".")) as $h
-  | ($h | split(".")[1:] | join(".")) as $dom
-  | if $dom != "" and ($d | any(. == $dom)) then $h else (($n.ipv4Address // "-") | split("/")[0]) end;'
+# jq: the address to show for a VM. The DNS name treepot gave it (treepot.host label) while the Mac can still
+# resolve that name's domain ($d, from `container system dns list`), otherwise its IP.
+JQ_ADDR='def addr: (.configuration.labels["treepot.host"] // "") as $h
+  | if $h != "" and ($d | any(. as $x | $h | endswith("." + $x))) then $h
+    else ((.status.networks[0].ipv4Address // "-") | split("/")[0]) end;'
 dns_domains() { container system dns list 2>/dev/null | awk 'NR>1{print $1}' | jq -Rsc 'split("\n") | map(select(. != ""))'; }
 addr() { container inspect "$1" | jq -r --argjson d "$(dns_domains)" "$JQ_ADDR .[0] | addr"; }
+# The domain VMs can be named under: set in container's config AND resolvable from the Mac. Empty until 'treepot dns'.
+dns_domain() {
+  local d; d=$(dns_configured)
+  [[ -z $d ]] || container system dns list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$d" || d=""
+  echo "$d"
+}
+# `container run` args that give a VM a DNS name (nothing when DNS is not set up).
+named() { [[ -z $DOMAIN ]] || printf '%s\n' --network "default,alias=$1" -l "treepot.host=$1"; }
 
 # Everything treepot creates is labelled with the worktree's slug, so status/down/destroy never depend on the current config.
 # A VM whose settings changed since it was created (different treepot.spec) is replaced; its volumes are kept.
@@ -146,6 +162,7 @@ start_service() { # <name>
   image=$(cfg "service.$name.image"); [[ -n $image ]] || image=$(preset_image "$name")
   [[ -n $image ]] || die "service '$name' needs 'image = ...' in $CFG"
   while IFS= read -r kv; do [[ -z $kv ]] || run+=(-e "$kv"); done < <(cfg_all "service.$name.env")
+  while IFS= read -r kv; do run+=("$kv"); done < <(named "$name.$HOST")
 
   case $name in
     postgres)
@@ -196,6 +213,16 @@ cmd_up() {
   APP_ARGS=(-e BINDING=0.0.0.0
     -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e "GIT_CONFIG_VALUE_0=*")
   HOSTS="" HAVE_DB=""
+  DOMAIN=$(dns_domain) HOST=""
+  if [[ -n $DOMAIN ]]; then
+    HOST=$(host_for "$SLUG" "$PROJECT" "$DOMAIN")
+    # Rails' default allow-list takes one subdomain level under .test; this admits <worktree>.<project>.<domain> too.
+    APP_ARGS+=(-e "TREEPOT_HOST=$HOST" -e "RAILS_DEVELOPMENT_HOSTS=.$(apex_for "$PROJECT" "$DOMAIN")")
+    while IFS= read -r kv; do APP_ARGS+=("$kv"); done < <(named "$HOST")
+  fi
+  if [[ -f $CERTS/cert.pem && -f $CERTS/key.pem ]]; then
+    APP_ARGS+=(-v "$CERTS:/etc/treepot/tls:ro" -e TREEPOT_TLS_CERT=/etc/treepot/tls/cert.pem -e TREEPOT_TLS_KEY=/etc/treepot/tls/key.pem)
+  fi
   # Rails names its databases in database.yml; everything else gets a ready-made "app" database in the URL.
   DBNAME=/app; [[ ! -f $TOP/config/database.yml ]] || DBNAME=""
 
@@ -223,12 +250,21 @@ cmd_up() {
   [[ -z $SETUP ]] || container exec -w "$TOP" "$SLUG-app" sh -c "$SETUP"
   echo "up: $SLUG"
   cmd_status | sed 's/^/  /'
+  local scheme=http; [[ ! -f $CERTS/cert.pem ]] || scheme=https
   if [[ -f $TOP/bin/rails ]]; then
     echo "next: treepot rails db:prepare && treepot rails s   ->   http://$(addr "$SLUG-app"):3000"
   else
-    echo "next: treepot <command>   (a server must bind 0.0.0.0 to be reachable from the Mac)"
+    echo "next: the app VM is idle until you start something in it:"
+    echo "  treepot <command>   run your server (it must bind 0.0.0.0)   ->   $scheme://$(addr "$SLUG-app")"
+    echo "  treepot bash        open a shell in the VM"
   fi
-  [[ $(addr "$SLUG-app") == *[a-z]* ]] || echo "tip: run 'treepot dns' once for stable names ($SLUG-app.test) instead of IPs"
+  if [[ -z $DOMAIN ]]; then
+    echo "tip: run 'treepot dns' once for stable names ($(host_for "$SLUG" "$PROJECT" test)) instead of IPs"
+  elif [[ ! -f $CERTS/cert.pem ]]; then
+    echo "tip: run 'treepot cert' for a trusted HTTPS certificate covering $HOST"
+  else
+    echo "tls: serve HTTPS with \$TREEPOT_TLS_CERT and \$TREEPOT_TLS_KEY (see README)"
+  fi
 }
 
 cmd_exec() {
@@ -286,6 +322,25 @@ cmd_config() { # [path]: open this project's config in $EDITOR
   fi
 }
 
+cmd_cert() { # one trusted wildcard certificate per project, made with mkcert and mounted into every app VM
+  local d apex
+  d=$(dns_domain); [[ -n $d ]] || die "set up names first: run 'treepot dns'"
+  command -v mkcert >/dev/null || die "mkcert is not installed; run 'brew install mkcert', then 'treepot cert' again"
+  apex=$(apex_for "$PROJECT" "$d")
+  if [[ ! -f $(mkcert -CAROOT)/rootCA.pem ]]; then
+    echo "mkcert needs a one-time local certificate authority, added to this Mac's trusted roots."
+    echo "Certificates it issues are then trusted by your browsers. macOS will ask for your password."
+    read -r -p "Create and trust it now? [y/N] " a
+    [[ $a == y || $a == Y ]] || die "aborted"
+  fi
+  mkcert -install
+  mkdir -p "$CERTS"
+  mkcert -cert-file "$CERTS/cert.pem" -key-file "$CERTS/key.pem" "$apex" "*.$apex"
+  echo "wrote $CERTS/cert.pem and key.pem for $apex and *.$apex (every worktree's app)"
+  echo "next: run 'treepot up'; the app VM then has \$TREEPOT_TLS_CERT, \$TREEPOT_TLS_KEY and \$TREEPOT_HOST."
+  echo "  Point your server at them on port 443, then open https://$(host_for "$SLUG" "$PROJECT" "$d")"
+}
+
 dns_configured() { # the domain container registers VMs under, or nothing
   container system property list 2>/dev/null | awk '/^\[dns\]/{f=1; next} /^\[/{f=0} f && $1=="domain"{gsub(/"/, "", $3); print $3}'
 }
@@ -297,7 +352,7 @@ cmd_dns() { # [status | <domain>]: one-time setup of Apple container's local DNS
     echo "container's DNS domain:   ${cur:-not set}"
     echo "resolvable from this Mac: ${reg:-none}"
     if [[ -n $cur && " $reg " == *" $cur "* ]]; then
-      echo "ok: VMs are reachable as <project>-<worktree>-<service>.$cur"
+      echo "ok: apps are reachable as <project>.$cur (main worktree) and <worktree>.<project>.$cur"
     else
       echo "not set up: run 'treepot dns'"
     fi
@@ -323,7 +378,7 @@ domain = \"$want\""
     echo "Registering .$want with macOS; sudo may ask for your password."
     sudo container system dns create "$want"
   fi
-  echo "done: after the next 'treepot up', VMs are reachable as <project>-<worktree>-<service>.$want"
+  echo "done: after the next 'treepot up', apps are reachable as <project>.$want (main worktree) and <worktree>.<project>.$want"
 }
 
 cmd_init() { # [template] [--with a,b|none]: write a starter config for this project
@@ -365,7 +420,8 @@ usage: treepot <command>   (run anywhere inside your project; each git worktree 
   init [template] [--with postgres,mysql,redis|none]
                 write a starter config; picks the template and services from the project if not given
   config [path] edit this project's config in \$EDITOR ('config path' prints its location); 'treepot up' applies it
-  dns [domain]  one-time setup of stable names (<worktree>-app.test) instead of IPs; 'dns status' to check
+  dns [domain]  one-time setup of stable names (myapp.test, feature.myapp.test) instead of IPs; 'dns status' to check
+  cert          make a trusted HTTPS certificate for this project's names (needs mkcert); 'treepot up' mounts it
   build         (re)build the app image for this Ruby version (Ruby apps only)
 Rails apps need no config. Anything else, and any override: $TREEPOT_CONFIG/<project>.ini  (see README)
 EOF
@@ -383,12 +439,14 @@ main() {
   else
     TOP=$(find_root "$PWD" "$TREEPOT_CONFIG") COMMON=$TOP/.git
   fi
-  local project; project=$(project_for "$COMMON")
-  SLUG=$(slug_for "$TOP" "$project")
-  CFG=$TREEPOT_CONFIG/$project.ini
+  PROJECT=$(project_for "$COMMON")
+  SLUG=$(slug_for "$TOP" "$PROJECT")
+  CFG=$TREEPOT_CONFIG/$PROJECT.ini
+  CERTS=$TREEPOT_CONFIG/certs/$PROJECT
 
   if [[ $1 == init ]]; then shift; cmd_init "$@"; exit; fi
   if [[ $1 == config ]]; then shift; cmd_config "$@"; exit; fi
+  if [[ $1 == cert ]]; then cmd_cert; exit; fi
   [[ ! -f $CFG ]] || git config -f "$CFG" --list >/dev/null || die "can't parse $CFG"
   [[ -f $CFG || ! -f ${CFG%.ini}.env ]] || die "${CFG%.ini}.env is the old config format; delete it and run 'treepot init'"
 
