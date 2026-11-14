@@ -1,8 +1,8 @@
 class Treepot < Formula
   desc "Per-worktree dev environments in Apple container micro-VMs"
   homepage "https://github.com/mbroadhead/treepot"
-  url "https://github.com/mbroadhead/treepot/archive/refs/tags/v0.3.0.tar.gz"
-  sha256 "8ebd754a8e0b2bdd35ee95a74da699dadaa8a2339b3c362f9e0d759b6c979e0e"
+  url "https://github.com/mbroadhead/treepot/archive/refs/tags/v0.4.0.tar.gz"
+  sha256 "e0c3a858224ab1a7248c01f26ded42e5e04786f8fed3f354c86dc0eb1665e10d"
   license "MIT"
   head "https://github.com/mbroadhead/treepot.git", branch: "main"
 
