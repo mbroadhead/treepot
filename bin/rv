@@ -166,6 +166,7 @@ main() {
   command -v container >/dev/null || die "Apple 'container' CLI not found (brew install container && container system start)"
 
   TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
+  [[ -f $TOP/Gemfile ]] || die "no Gemfile in $TOP; run rv from a Rails app's worktree"
   COMMON=$(git rev-parse --path-format=absolute --git-common-dir)
   local project; project=$(project_for "$COMMON")
   SLUG=$(slug_for "$TOP" "$project")
