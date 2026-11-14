@@ -3,6 +3,7 @@
 set -euo pipefail
 
 RV_HOME="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.." && pwd)"
+RV_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/rv"
 
 die() { echo "rv: $*" >&2; exit 1; }
 
@@ -157,7 +158,7 @@ usage: rv <command>   (run inside any git worktree of a Rails app)
   down          remove the VMs, keep volumes
   destroy [-f]  down + delete the database and gem volumes
   build         (re)build the app image for this Ruby version
-Per-project overrides: $RV_HOME/projects/<project>.env  (see README)
+Per-project overrides: $RV_CONFIG/<project>.env  (see README)
 EOF
 }
 
@@ -172,13 +173,13 @@ main() {
   SLUG=$(slug_for "$TOP" "$project")
 
   # shellcheck disable=SC1090
-  [[ ! -f $RV_HOME/projects/$project.env ]] || source "$RV_HOME/projects/$project.env"
+  [[ ! -f $RV_CONFIG/$project.env ]] || source "$RV_CONFIG/$project.env"
   : "${RUBY_VERSION:=$(detect_ruby "$TOP")}"
   : "${DB:=$(detect_db "$TOP")}"
   [[ $DB != mysql ]] || DB=mysql2
   if [[ -z ${REDIS:-} ]]; then REDIS=0; ! has_gem "$TOP" redis || REDIS=1; fi
   IMAGE_SET=${IMAGE:-}
-  [[ -n $IMAGE_SET || -n $RUBY_VERSION ]] || die "can't detect the Ruby version; set RUBY_VERSION in $RV_HOME/projects/$project.env"
+  [[ -n $IMAGE_SET || -n $RUBY_VERSION ]] || die "can't detect the Ruby version; set RUBY_VERSION in $RV_CONFIG/$project.env"
   : "${IMAGE:=rv-ruby:$RUBY_VERSION}"
 
   case $1 in

@@ -6,7 +6,7 @@ Run any Rails app in Apple [`container`](https://github.com/apple/container) mic
 
 ```sh
 brew install container && container system start   # once
-ln -s "$PWD/bin/rv" /usr/local/bin/rv               # or add bin/ to PATH
+ln -s "$PWD/bin/rv" ~/.local/bin/rv                # any directory on your PATH
 ```
 
 ## Use
@@ -31,10 +31,10 @@ rv destroy            # also delete the volumes; run before `git worktree remove
 | Database | `pg` / `mysql2` / `trilogy` in `Gemfile.lock`, else sqlite (no DB VM) | `DB`, `DB_IMAGE` |
 | Redis | `redis` gem in `Gemfile.lock` | `REDIS=0\|1`, `REDIS_IMAGE` |
 
-Overrides go in `projects/<project>.env`, where `<project>` is the main repo's directory name:
+Overrides go in `~/.config/rv/<project>.env`, where `<project>` is the main repo's directory name:
 
 ```sh
-# projects/shop.env
+# ~/.config/rv/shop.env
 DB_IMAGE=mariadb:11          # default: postgres:17 or mysql:8.4
 APT_PACKAGES="libvips-dev"   # extra packages for the app image; run `rv build` after changing
 IMAGE=my/custom:image        # skip the built image entirely (use for Rubies too old for the Dockerfile)
