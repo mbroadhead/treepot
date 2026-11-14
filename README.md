@@ -7,9 +7,12 @@ Rails apps need no configuration. Any other language or framework works with a s
 ## Setup
 
 ```sh
-brew install container && container system start   # once
-ln -s "$PWD/bin/treepot" ~/.local/bin/treepot                # any directory on your PATH
+brew tap mbroadhead/treepot https://github.com/mbroadhead/treepot
+brew install treepot             # also installs Apple's container tool
+container system start           # once; offers to download a Linux kernel
 ```
+
+Or from a clone, with no Homebrew: `ln -s "$PWD/bin/treepot" ~/.local/bin/treepot` (any directory on your PATH), after installing `container` yourself.
 
 ## Use
 
