@@ -471,7 +471,8 @@ main() {
     down) cmd_down ;;
     destroy) cmd_destroy "${2:-}" ;;
     build) [[ -n $BUILD ]] || die "the app image is set in the config, so there is nothing to build"; build_image ;;
-    *) cmd_exec "$@" ;;
+    run) cmd_exec "$@" ;;
+    *) die "unknown command: ${1:-}" ;;
   esac
 }
 
